@@ -9,6 +9,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// Lean windows.h so it doesn't pull in winsock.h - httplib.h (qwen3-asr-server)
+// includes winsock2.h, and a prior winsock.h breaks that TU with sockaddr etc.
+// redefinitions. The file-mapping APIs used here are unaffected.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #else
 #include <cerrno>

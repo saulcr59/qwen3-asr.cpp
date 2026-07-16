@@ -1,6 +1,9 @@
-#include "qwen3_asr.h"
-
+// httplib.h first: it includes winsock2.h, which must come before anything that
+// drags in windows.h (qwen3_asr.h -> platform_mmap.h) or MSVC fails the whole TU
+// with sockaddr/fd_set redefinitions.
 #include "httplib.h"
+
+#include "qwen3_asr.h"
 
 #include <algorithm>
 #include <atomic>
