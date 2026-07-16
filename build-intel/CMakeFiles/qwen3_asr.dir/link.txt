@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen3_asr.a CMakeFiles/qwen3_asr.dir/src/qwen3_asr.cpp.o
+/usr/bin/ranlib libqwen3_asr.a

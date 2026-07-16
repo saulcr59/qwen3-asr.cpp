@@ -5,6 +5,7 @@
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <gguf.h>
+#include "platform_mmap.h"
 #include <string>
 #include <map>
 #include <vector>
@@ -70,8 +71,7 @@ struct text_decoder_model {
     ggml_backend_buffer_t buffer = nullptr;
     
     // mmap state — must outlive all tensors backed by this mapping
-    void * mmap_addr = nullptr;
-    size_t mmap_size = 0;
+    mapped_file_view mmap;
     
     // Tensor name to tensor mapping
     std::map<std::string, ggml_tensor *> tensors;
@@ -111,6 +111,7 @@ public:
     
     // Load model from GGUF file
     bool load_model(const std::string & model_path);
+    void set_n_threads(int n_threads);
     
     // Initialize KV cache for given context length
     bool init_kv_cache(int32_t n_ctx);
@@ -171,6 +172,7 @@ private:
     text_decoder_state state_;
     std::string error_msg_;
     std::vector<std::string> vocab_;
+    int n_threads_ = 4;
 };
 
 // Free model resources

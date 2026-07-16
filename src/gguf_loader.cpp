@@ -1,11 +1,8 @@
 #include "gguf_loader.h"
-#include "mman_multiplatform.h"
-#include "stat_multiplatform.h"
 
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <fcntl.h>
 #include <ggml-impl.h>
 
 namespace qwen3_asr {
@@ -244,33 +241,19 @@ bool GGUFLoader::create_tensors(gguf_context * ctx, audio_encoder_model & model)
 
 bool GGUFLoader::load_tensor_data(const std::string & path, gguf_context * ctx,
                                    audio_encoder_model & model) {
-    int fd = open(path.c_str(), O_BINARY);
-    if (fd < 0) {
-        error_msg_ = "Failed to open file for mmap: " + path;
+    if (!map_file_readonly(path, model.mmap, error_msg_)) {
         return false;
     }
-    
-    struct stat64 st {};
-    if (fstat64(fd, &st) != 0) {
-        error_msg_ = "Failed to stat file: " + path;
-        close(fd);
-        return false;
-    }
-    
-    void * mmap_addr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    
-    if (mmap_addr == MAP_FAILED) {
-        error_msg_ = "Failed to mmap file: " + path;
-        return false;
-    }
-    
-    model.mmap_addr = mmap_addr;
-    model.mmap_size = st.st_size;
-    
+
     const size_t data_offset = gguf_get_data_offset(ctx);
-    const size_t total_size = st.st_size - data_offset;
-    uint8_t * data_base = (uint8_t *)mmap_addr + data_offset;
+    if (data_offset > model.mmap.size) {
+        error_msg_ = "Invalid GGUF data offset in file: " + path;
+        unmap_file(model.mmap);
+        return false;
+    }
+
+    const size_t total_size = model.mmap.size - data_offset;
+    uint8_t * data_base = static_cast<uint8_t *>(model.mmap.addr) + data_offset;
     
     // Find largest tensor for max_tensor_size hint
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
@@ -313,9 +296,7 @@ bool GGUFLoader::load_tensor_data(const std::string & path, gguf_context * ctx,
         }
         if (!model.buffer) {
             error_msg_ = "Failed to create buffer from mmap";
-            munmap(mmap_addr, st.st_size);
-            model.mmap_addr = nullptr;
-            model.mmap_size = 0;
+            unmap_file(model.mmap);
             return false;
         }
 
@@ -344,10 +325,8 @@ void free_model(audio_encoder_model & model) {
         ggml_free(model.ctx);
         model.ctx = nullptr;
     }
-    if (model.mmap_addr) {
-        munmap(model.mmap_addr, model.mmap_size);
-        model.mmap_addr = nullptr;
-        model.mmap_size = 0;
+    if (model.mmap.addr) {
+        unmap_file(model.mmap);
     }
     model.tensors.clear();
     model.layers.clear();

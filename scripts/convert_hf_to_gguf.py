@@ -211,13 +211,23 @@ class Qwen3ASRConverter:
         else:
             self.model_name = "Qwen3-ASR-0.6B"
 
-        print({
-            "model_name": self.model_name,
-            "d_model": self.audio_d_model,
-            "encoder_attention_heads": self.audio_attention_heads,
-            "encoder_ffn_dim": self.audio_ffn_dim,
-            "encoder_layers": self.audio_encoder_layers,
-        })
+    def _load_tokenizer_config(self) -> dict[str, Any]:
+        """Load tokenizer_config.json if present."""
+        tokenizer_config_path = self.input_dir / "tokenizer_config.json"
+        if not tokenizer_config_path.exists():
+            return {}
+
+        with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_vocab_dict(self) -> dict[str, int]:
+        """Load the base tokenizer vocab from vocab.json only."""
+        vocab_path = self.input_dir / "vocab.json"
+        if not vocab_path.exists():
+            raise FileNotFoundError(f"Vocab file not found: {vocab_path}")
+
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     def _map_tensor_name(self, hf_name: str) -> str | None:
         """Map HuggingFace tensor name to GGML convention."""
@@ -350,34 +360,35 @@ class Qwen3ASRConverter:
 
     def _load_tokenizer(self) -> tuple[list[str], list[int], list[str]]:
         """Load tokenizer vocabulary and merges."""
-        vocab_path = self.input_dir / "vocab.json"
+        vocab_dict = self._load_vocab_dict()
+        tokenizer_config = self._load_tokenizer_config()
         merges_path = self.input_dir / "merges.txt"
 
-        if not vocab_path.exists():
-            raise FileNotFoundError(f"Vocab file not found: {vocab_path}")
+        added_tokens = tokenizer_config.get("added_tokens_decoder", {})
+        max_vocab_id = max(vocab_dict.values()) if vocab_dict else -1
+        max_added_id = max((int(tok_id) for tok_id in added_tokens.keys()), default=-1)
+        token_count = max(self.vocab_size, max_vocab_id + 1, max_added_id + 1)
 
-        # Load vocabulary
-        with open(vocab_path, "r", encoding="utf-8") as f:
-            vocab_dict = json.load(f)
+        tokens = [f"[PAD{i}]" for i in range(token_count)]
+        toktypes = [gguf.TokenType.UNUSED] * token_count
 
-        # Sort by token ID
-        sorted_vocab = sorted(vocab_dict.items(), key=lambda x: x[1])
+        for token, token_id in vocab_dict.items():
+            tokens[token_id] = token
+            toktypes[token_id] = gguf.TokenType.NORMAL
 
-        tokens = []
-        toktypes = []
+        for token_id_str, token_info in added_tokens.items():
+            token_id = int(token_id_str)
+            token = token_info.get("content")
+            if token is None:
+                continue
 
-        for token, token_id in sorted_vocab:
-            tokens.append(token)
-            # Determine token type
-            if token.startswith("<|") and token.endswith("|>"):
-                toktypes.append(gguf.TokenType.CONTROL)
-            else:
-                toktypes.append(gguf.TokenType.NORMAL)
-
-        # Pad to vocab_size if needed
-        while len(tokens) < self.vocab_size:
-            tokens.append(f"[PAD{len(tokens)}]")
-            toktypes.append(gguf.TokenType.UNUSED)
+            tokens[token_id] = token
+            toktypes[token_id] = (
+                gguf.TokenType.CONTROL
+                if token_info.get("special", False)
+                else gguf.TokenType.NORMAL
+            )
+            vocab_dict[token] = token_id
 
         # Load merges
         merges = []
@@ -388,6 +399,10 @@ class Qwen3ASRConverter:
                     if line and not line.startswith("#"):
                         merges.append(line)
 
+        logger.info(
+            "Using tokenizer vocab built from vocab.json + tokenizer_config.json "
+            f"({len(vocab_dict)} entries)"
+        )
         return tokens, toktypes, merges
 
     def convert(self) -> None:
@@ -503,6 +518,13 @@ class Qwen3ASRConverter:
     def _add_tokenizer(self, writer: gguf.GGUFWriter) -> None:
         """Add tokenizer to GGUF writer."""
         tokens, toktypes, merges = self._load_tokenizer()
+        vocab = self._load_vocab_dict()
+        tokenizer_config = self._load_tokenizer_config()
+
+        for token_id_str, token_info in tokenizer_config.get("added_tokens_decoder", {}).items():
+            token = token_info.get("content")
+            if token is not None:
+                vocab[token] = int(token_id_str)
 
         # Tokenizer model type
         writer.add_tokenizer_model("gpt2")
@@ -517,40 +539,26 @@ class Qwen3ASRConverter:
             writer.add_token_merges(merges)
 
         # Special tokens from tokenizer_config.json
-        tokenizer_config_path = self.input_dir / "tokenizer_config.json"
-        if tokenizer_config_path.exists():
-            with open(tokenizer_config_path, "r", encoding="utf-8") as f:
-                tokenizer_config = json.load(f)
+        eos_token = tokenizer_config.get("eos_token")
+        if isinstance(eos_token, dict):
+            eos_token = eos_token.get("content")
+        if eos_token and eos_token in vocab:
+            writer.add_eos_token_id(vocab[eos_token])
 
-            # EOS token
-            eos_token = tokenizer_config.get("eos_token")
-            if isinstance(eos_token, dict):
-                eos_token = eos_token.get("content")
-            if eos_token:
-                # Find token ID
-                vocab_path = self.input_dir / "vocab.json"
-                with open(vocab_path, "r", encoding="utf-8") as f:
-                    vocab = json.load(f)
-                if eos_token in vocab:
-                    writer.add_eos_token_id(vocab[eos_token])
+        pad_token = tokenizer_config.get("pad_token")
+        if isinstance(pad_token, dict):
+            pad_token = pad_token.get("content")
+        if pad_token and pad_token in vocab:
+            writer.add_pad_token_id(vocab[pad_token])
 
-            # PAD token
-            pad_token = tokenizer_config.get("pad_token")
-            if isinstance(pad_token, dict):
-                pad_token = pad_token.get("content")
-            if pad_token:
-                vocab_path = self.input_dir / "vocab.json"
-                with open(vocab_path, "r", encoding="utf-8") as f:
-                    vocab = json.load(f)
-                if pad_token in vocab:
-                    writer.add_pad_token_id(vocab[pad_token])
+        chat_template = tokenizer_config.get("chat_template")
+        if chat_template:
+            writer.add_chat_template(chat_template)
 
-            # Chat template
-            chat_template = tokenizer_config.get("chat_template")
-            if chat_template:
-                writer.add_chat_template(chat_template)
-
-        logger.info(f"Added tokenizer with {len(tokens)} tokens and {len(merges)} merges")
+        logger.info(
+            "Added tokenizer with "
+            f"{len(tokens)} tokens and {len(merges)} merges from vocab.json + tokenizer_config.json"
+        )
 
 
 def main():

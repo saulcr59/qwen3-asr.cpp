@@ -9,8 +9,16 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <clocale>
 #include <string>
 #include <fstream>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 struct cli_params {
     std::string model_path = "models/qwen3-asr-0.6b-f16.gguf";
@@ -167,6 +175,24 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
     return true;
 }
 
+static std::string normalize_language_name(std::string lang) {
+    std::transform(lang.begin(), lang.end(), lang.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (lang == "zh" || lang == "zh-cn" || lang == "zh-tw" || lang == "zh-hans" ||
+        lang == "zh-hant" || lang == "cmn" || lang == "mandarin" ||
+        lang == "cantonese" || lang == "yue") {
+        return "chinese";
+    }
+    if (lang == "ko" || lang == "kr") {
+        return "korean";
+    }
+    if (lang == "ja" || lang == "jp") {
+        return "japanese";
+    }
+    return lang;
+}
+
 static std::string detect_language(const std::string & asr_language_token) {
     std::string lang = asr_language_token;
 
@@ -187,13 +213,50 @@ static std::string detect_language(const std::string & asr_language_token) {
     if (lang == "<|en|>") return "english";
     if (lang == "<|ko|>") return "korean";
 
-    return lang;
+    return normalize_language_name(lang);
 }
 
 static std::string extract_transcript(const std::string & asr_text) {
-    // Qwen3 ASR text doesn't have "language " prefix in the text itself.
-    // It's just the raw transcript.
-    return asr_text;
+    const std::string prefix = "language ";
+    if (asr_text.size() < prefix.size() || asr_text.compare(0, prefix.size(), prefix) != 0) {
+        if (asr_text.rfind("<asr_text>", 0) == 0) {
+            return asr_text.substr(sizeof("<asr_text>") - 1);
+        }
+        return asr_text;
+    }
+
+    size_t pos = prefix.size();
+    if (pos >= asr_text.size()) {
+        return "";
+    }
+
+    unsigned char first = static_cast<unsigned char>(asr_text[pos]);
+    if (!std::isupper(first)) {
+        return asr_text;
+    }
+
+    ++pos;
+    while (pos < asr_text.size()) {
+        unsigned char c = static_cast<unsigned char>(asr_text[pos]);
+        if (!std::islower(c)) {
+            break;
+        }
+        ++pos;
+    }
+
+    while (pos < asr_text.size()) {
+        unsigned char c = static_cast<unsigned char>(asr_text[pos]);
+        if (c >= 0x80 || !std::isspace(c)) {
+            break;
+        }
+        ++pos;
+    }
+
+    std::string transcript = asr_text.substr(pos);
+    if (transcript.rfind("<asr_text>", 0) == 0) {
+        transcript.erase(0, sizeof("<asr_text>") - 1);
+    }
+    return transcript;
 }
 
 static std::string escape_json_string(const std::string & s) {
@@ -365,12 +428,14 @@ static std::string find_korean_dict(const std::string & model_path) {
 }
 
 static int run_alignment(const cli_params & params) {
+    const std::string align_lang = normalize_language_name(params.language);
+
     fprintf(stderr, "qwen3-asr-cli (Forced Alignment Mode)\n");
     fprintf(stderr, "  Model: %s\n", params.model_path.c_str());
     fprintf(stderr, "  Audio: %s\n", params.audio_path.c_str());
     fprintf(stderr, "  Text: %s\n", params.align_text.c_str());
-    if (!params.language.empty()) {
-        fprintf(stderr, "  Language: %s\n", params.language.c_str());
+    if (!align_lang.empty()) {
+        fprintf(stderr, "  Language: %s\n", align_lang.c_str());
     }
     fprintf(stderr, "\n");
     
@@ -380,8 +445,9 @@ static int run_alignment(const cli_params & params) {
         fprintf(stderr, "Error: %s\n", aligner.get_error().c_str());
         return 1;
     }
+    aligner.set_n_threads(params.n_threads);
     
-    if (params.language == "korean") {
+    if (align_lang == "korean") {
         std::string dict_path = find_korean_dict(params.model_path);
         if (dict_path.empty()) {
             fprintf(stderr, "Warning: Korean dictionary not found. Falling back to whitespace splitting.\n");
@@ -394,7 +460,7 @@ static int run_alignment(const cli_params & params) {
     
     fprintf(stderr, "Model loaded. Running alignment...\n");
     
-    auto result = aligner.align(params.audio_path, params.align_text, params.language);
+    auto result = aligner.align(params.audio_path, params.align_text, align_lang);
     
     if (!result.success) {
         fprintf(stderr, "Error: %s\n", result.error_msg.c_str());
@@ -505,6 +571,7 @@ static int run_transcribe_and_align(const cli_params & params) {
         fprintf(stderr, "Error (Aligner): %s\n", aligner.get_error().c_str());
         return 1;
     }
+    aligner.set_n_threads(params.n_threads);
 
     std::vector<float> all_samples;
     int sample_rate;
@@ -529,7 +596,13 @@ static int run_transcribe_and_align(const cli_params & params) {
     int64_t total_asr_ms = 0;
     int64_t total_align_ms = 0;
 
-    std::string global_lang = params.language;
+    std::string global_lang = normalize_language_name(params.language);
+    if (global_lang == "korean") {
+        std::string dict_path = find_korean_dict(params.aligner_model_path);
+        if (!dict_path.empty()) {
+            aligner.load_korean_dict(dict_path);
+        }
+    }
 
     for (int c = 0; c < n_chunks; ++c) {
         int start = c * chunk_stride_samples;
@@ -636,7 +709,16 @@ static void ggml_log_callback_quiet(enum ggml_log_level level, const char * text
     }
 }
 
+static void configure_console_utf8() {
+    std::setlocale(LC_ALL, ".UTF-8");
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+}
+
 int main(int argc, char ** argv) {
+    configure_console_utf8();
     ggml_log_set(ggml_log_callback_quiet, nullptr);
 
     cli_params params;

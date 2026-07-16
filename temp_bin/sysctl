@@ -1,0 +1,6 @@
+#!/bin/bash
+if [[ "$*" == *"machdep.cpu.brand_string"* ]]; then
+  echo "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz"
+else
+  /usr/sbin/sysctl "$@"
+fi

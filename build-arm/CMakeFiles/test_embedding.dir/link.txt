@@ -1,0 +1,1 @@
+/usr/bin/c++  -Wall -Wextra -Wpedantic -O3 -DNDEBUG -O3 -march=native -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_embedding.dir/tests/test_embedding.cpp.o -o test_embedding   -L/Users/nikolajolsson/git/qwen3-asr.cpp/ggml/build/src  -Wl,-rpath,/Users/nikolajolsson/git/qwen3-asr.cpp/ggml/build/src -lggml -lggml-base -lggml-cpu

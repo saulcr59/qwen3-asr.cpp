@@ -82,6 +82,9 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
                                                  const transcribe_params & params) {
     transcribe_result result;
     int64_t t_total_start = get_time_ms();
+
+    encoder_.set_n_threads(params.n_threads);
+    decoder_.set_n_threads(params.n_threads);
     
     int64_t t_mel_start = get_time_ms();
     MelSpectrogram mel;
@@ -131,9 +134,12 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
     result.t_decode_ms = get_time_ms() - t_decode_start;
     
     result.tokens = output_tokens;
-    std::vector text_tokens(output_tokens.begin() + 2, output_tokens.end());  // remove language token
+    const size_t text_start = std::min<size_t>(output_tokens.size(), 2);  // remove language prefix tokens
+    std::vector text_tokens(output_tokens.begin() + text_start, output_tokens.end());
     result.text = decoder_.decode_tokens(text_tokens);
-    result.language = decoder_.decode_token(output_tokens[1]);
+    if (output_tokens.size() >= 2) {
+        result.language = decoder_.decode_token(output_tokens[1]);
+    }
     result.success = true;
     
     result.t_total_ms = get_time_ms() - t_total_start;

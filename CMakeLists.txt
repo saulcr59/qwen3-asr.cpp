@@ -28,7 +28,6 @@ option(GGML_AVX2 "ggml: enable AVX2" ON)
 option(GGML_FMA "ggml: enable FMA" ON)
 option(GGML_F16C "ggml: enable F16c" ON)
 option(GGML_VULKAN "ggml: enable Vulkan backend" OFF)
-option(GGML_METAL "ggml: enable Metal backend" OFF)
 
 # Compiler flags
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -41,6 +40,7 @@ elseif(MSVC)
         "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
     )
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
 endif()
 
 # Timing instrumentation option
@@ -51,6 +51,7 @@ endif()
 
 add_subdirectory(ggml)
 file(GLOB SOURCES "src/*.*")
+list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/server.cpp")
 
 find_package(Threads REQUIRED)
 
@@ -77,14 +78,14 @@ if (APPLE)
     target_link_libraries(qwen3-asr PRIVATE "-framework Accelerate")
 endif ()
 
-target_include_directories(qwen3-asr PRIVATE
+target_include_directories(qwen3-asr PUBLIC
         ggml/include
-        ggml/src
         include
         src
 )
+target_include_directories(qwen3-asr PRIVATE ggml/src)
 
-target_link_libraries(qwen3-asr PRIVATE ggml Threads::Threads)
+target_link_libraries(qwen3-asr PUBLIC ggml PRIVATE Threads::Threads)
 
 # ==================================== CLI ====================================
 add_executable(qwen3-asr-cli
@@ -100,6 +101,20 @@ target_include_directories(qwen3-asr-cli PRIVATE
 
 target_link_libraries(qwen3-asr-cli PRIVATE qwen3-asr ggml Threads::Threads)
 
+# ==================================== Server ====================================
+add_executable(qwen3-asr-server
+        src/server.cpp
+)
+
+target_include_directories(qwen3-asr-server PRIVATE
+        ggml/include
+        ggml/src
+        include
+        src
+        third_party
+)
+
+target_link_libraries(qwen3-asr-server PRIVATE qwen3-asr ggml Threads::Threads)
 
 # ==================================== Test  ====================================
 if (QWEN3_ASR_TEST)
@@ -109,6 +124,7 @@ if (QWEN3_ASR_TEST)
     target_link_libraries(qwen3asr-test PRIVATE qwen3-asr ggml Threads::Threads)
 
     # unit test
+    enable_testing()
     add_executable(test_attention_compare tests/test_attention_compare.cpp)
     add_executable(test_conv1 tests/test_conv1.cpp)
     add_executable(test_conv2d tests/test_conv2d.cpp)
@@ -131,6 +147,7 @@ if (QWEN3_ASR_TEST)
     add_executable(test_mel tests/test_mel.cpp)
     add_executable(test_mel_load tests/test_mel_load.cpp)
     add_executable(test_qk_compare tests/test_qk_compare.cpp)
+    add_executable(test_tokenization tests/test_tokenization.cpp)
 
     target_include_directories(test_attention_compare PRIVATE ggml/include include src)
     target_include_directories(test_conv1 PRIVATE ggml/include include src)
@@ -154,6 +171,7 @@ if (QWEN3_ASR_TEST)
     target_include_directories(test_mel PRIVATE ggml/include include src)
     target_include_directories(test_mel_load PRIVATE ggml/include include src)
     target_include_directories(test_qk_compare PRIVATE ggml/include include src)
+    target_include_directories(test_tokenization PRIVATE ggml/include include src)
 
     target_link_libraries(test_attention_compare PRIVATE qwen3-asr ggml Threads::Threads)
     target_link_libraries(test_conv1 PRIVATE qwen3-asr ggml Threads::Threads)
@@ -177,4 +195,26 @@ if (QWEN3_ASR_TEST)
     target_link_libraries(test_mel PRIVATE qwen3-asr ggml Threads::Threads)
     target_link_libraries(test_mel_load PRIVATE qwen3-asr ggml Threads::Threads)
     target_link_libraries(test_qk_compare PRIVATE qwen3-asr ggml Threads::Threads)
+    target_link_libraries(test_tokenization PRIVATE qwen3-asr ggml Threads::Threads)
+
+    add_test(NAME test_tokenization COMMAND test_tokenization)
 endif ()
+
+install(TARGETS qwen3-asr qwen3-asr-cli qwen3-asr-server
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+install(FILES
+    include/audio_injection.h
+    include/forced_aligner.h
+    include/qwen3_asr.h
+    src/audio_encoder.h
+    src/gguf_loader.h
+    src/mel_spectrogram.h
+    src/platform_mmap.h
+    src/qwen3asr_win_export.h
+    src/text_decoder.h
+    src/timing.h
+    DESTINATION include
+)
