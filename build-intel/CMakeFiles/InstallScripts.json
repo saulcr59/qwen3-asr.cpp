@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/nikolajolsson/git/qwen3-asr.cpp/build-intel/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

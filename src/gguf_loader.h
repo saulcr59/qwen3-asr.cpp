@@ -5,6 +5,7 @@
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <gguf.h>
+#include "platform_mmap.h"
 #include <string>
 #include <map>
 #include <vector>
@@ -95,8 +96,7 @@ struct audio_encoder_model {
     ggml_backend_buffer_t buffer = nullptr;
     
     // mmap state — must outlive all tensors backed by this mapping
-    void * mmap_addr = nullptr;
-    size_t mmap_size = 0;
+    mapped_file_view mmap;
     
     // Tensor name to tensor mapping
     std::map<std::string, ggml_tensor *> tensors;

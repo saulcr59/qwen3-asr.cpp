@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cassert>
+#include <vector>
 
 using namespace qwen3_asr;
 
@@ -34,7 +35,7 @@ static void test_embed_tokens() {
     const int32_t vocab_size = 10;
     const int32_t hidden_size = 4;
     
-    float token_embd[vocab_size * hidden_size];
+    std::vector<float> token_embd(vocab_size * hidden_size);
     for (int i = 0; i < vocab_size; ++i) {
         for (int j = 0; j < hidden_size; ++j) {
             token_embd[i * hidden_size + j] = static_cast<float>(i * 10 + j);
@@ -44,8 +45,8 @@ static void test_embed_tokens() {
     int32_t input_ids[] = {0, 5, 3};
     const int32_t n_tokens = 3;
     
-    float output[n_tokens * hidden_size];
-    embed_tokens(input_ids, n_tokens, token_embd, vocab_size, hidden_size, output);
+    std::vector<float> output(n_tokens * hidden_size);
+    embed_tokens(input_ids, n_tokens, token_embd.data(), vocab_size, hidden_size, output.data());
     
     assert(float_eq(output[0], 0.0f));
     assert(float_eq(output[1], 1.0f));
@@ -72,12 +73,12 @@ static void test_inject_audio_embeddings() {
     const int32_t hidden_size = 4;
     const int32_t n_audio_frames = 3;
     
-    float token_embeddings[n_tokens * hidden_size];
+    std::vector<float> token_embeddings(n_tokens * hidden_size);
     for (int i = 0; i < n_tokens * hidden_size; ++i) {
         token_embeddings[i] = static_cast<float>(i);
     }
     
-    float audio_features[n_audio_frames * hidden_size];
+    std::vector<float> audio_features(n_audio_frames * hidden_size);
     for (int i = 0; i < n_audio_frames * hidden_size; ++i) {
         audio_features[i] = static_cast<float>(100 + i);
     }
@@ -85,8 +86,8 @@ static void test_inject_audio_embeddings() {
     std::vector<int32_t> audio_positions = {1, 2, 3};
     
     bool success = inject_audio_embeddings(
-        token_embeddings, n_tokens, hidden_size,
-        audio_features, n_audio_frames, audio_positions);
+        token_embeddings.data(), n_tokens, hidden_size,
+        audio_features.data(), n_audio_frames, audio_positions);
     
     assert(success);
     

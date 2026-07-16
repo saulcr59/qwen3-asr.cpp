@@ -1,0 +1,2 @@
+/usr/bin/ar qc libmel_spectrogram.a CMakeFiles/mel_spectrogram.dir/src/mel_spectrogram.cpp.o
+/usr/bin/ranlib libmel_spectrogram.a

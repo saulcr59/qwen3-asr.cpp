@@ -1,0 +1,2 @@
+/usr/bin/ar qc libtext_decoder.a CMakeFiles/text_decoder.dir/src/text_decoder.cpp.o
+/usr/bin/ranlib libtext_decoder.a

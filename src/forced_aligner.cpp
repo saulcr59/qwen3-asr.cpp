@@ -1,7 +1,5 @@
 #include "forced_aligner.h"
 #include "mel_spectrogram.h"
-#include "mman_multiplatform.h"
-#include "stat_multiplatform.h"
 
 #include <cstdio>
 #include <cstring>
@@ -11,8 +9,8 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
-#include <fcntl.h>
 #include <ggml-impl.h>
+#include <ggml-cpu.h>
 
 #define QWEN3_FA_MAX_NODES 16384
 
@@ -52,6 +50,13 @@ ForcedAligner::~ForcedAligner() {
         state_.backend_cpu = nullptr;
     }
     free_forced_aligner_model(model_);
+}
+
+void ForcedAligner::set_n_threads(int n_threads) {
+    n_threads_ = std::max(1, n_threads);
+    if (state_.backend_cpu) {
+        ggml_backend_cpu_set_n_threads(state_.backend_cpu, n_threads_);
+    }
 }
 
 bool ForcedAligner::load_model(const std::string & model_path) {
@@ -126,8 +131,10 @@ bool ForcedAligner::load_model(const std::string & model_path) {
         error_msg_ = "Failed to create backend scheduler";
         return false;
     }
-    
+
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_FA_MAX_NODES + ggml_graph_overhead());
+
+    set_n_threads(n_threads_);
     
     model_loaded_ = true;
     return true;
@@ -415,33 +422,19 @@ bool ForcedAligner::create_tensors(gguf_context * ctx) {
 }
 
 bool ForcedAligner::load_tensor_data(const std::string & path, gguf_context * ctx) {
-    int fd = open(path.c_str(), O_BINARY);
-    if (fd < 0) {
-        error_msg_ = "Failed to open file for mmap: " + path;
+    if (!map_file_readonly(path, model_.mmap, error_msg_)) {
         return false;
     }
-    
-    struct stat64 st {};
-    if (fstat64(fd, &st) != 0) {
-        error_msg_ = "Failed to stat file: " + path;
-        close(fd);
-        return false;
-    }
-    
-    void * mmap_addr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    
-    if (mmap_addr == MAP_FAILED) {
-        error_msg_ = "Failed to mmap file: " + path;
-        return false;
-    }
-    
-    model_.mmap_addr = mmap_addr;
-    model_.mmap_size = st.st_size;
-    
+
     const size_t data_offset = gguf_get_data_offset(ctx);
-    const size_t total_size = st.st_size - data_offset;
-    uint8_t * data_base = (uint8_t *)mmap_addr + data_offset;
+    if (data_offset > model_.mmap.size) {
+        error_msg_ = "Invalid GGUF data offset in file: " + path;
+        unmap_file(model_.mmap);
+        return false;
+    }
+
+    const size_t total_size = model_.mmap.size - data_offset;
+    uint8_t * data_base = static_cast<uint8_t *>(model_.mmap.addr) + data_offset;
     
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
     size_t max_tensor_size = 0;
@@ -482,9 +475,7 @@ bool ForcedAligner::load_tensor_data(const std::string & path, gguf_context * ct
         }
         if (!model_.buffer) {
             error_msg_ = "Failed to create buffer from mmap";
-            munmap(mmap_addr, st.st_size);
-            model_.mmap_addr = nullptr;
-            model_.mmap_size = 0;
+            unmap_file(model_.mmap);
             return false;
         }
 
@@ -1512,23 +1503,122 @@ static std::string utf8_substr(const std::string & s, size_t char_start, size_t 
     return s.substr(byte_start, byte_end - byte_start);
 }
 
+static std::string normalize_alignment_language(std::string language) {
+    std::transform(language.begin(), language.end(), language.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (language == "zh" || language == "zh-cn" || language == "zh-tw" ||
+        language == "zh-hans" || language == "zh-hant" || language == "cmn" ||
+        language == "mandarin" || language == "cantonese" || language == "yue") {
+        return "chinese";
+    }
+    if (language == "ko" || language == "kr") {
+        return "korean";
+    }
+    if (language == "ja" || language == "jp") {
+        return "japanese";
+    }
+
+    return language;
+}
+
+static bool is_utf8_whitespace_char(const std::string & ch) {
+    if (ch.empty()) {
+        return true;
+    }
+    if (ch.size() == 1) {
+        return std::isspace(static_cast<unsigned char>(ch[0])) != 0;
+    }
+    return ch == "\xE3\x80\x80";
+}
+
+static bool utf8_char_is_cjk(const std::string & ch) {
+    if (ch.empty()) {
+        return false;
+    }
+
+    const unsigned char * s = reinterpret_cast<const unsigned char *>(ch.data());
+    uint32_t cp = 0;
+    if (ch.size() == 1) {
+        cp = s[0];
+    } else if (ch.size() == 2) {
+        cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+    } else if (ch.size() == 3) {
+        cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    } else if (ch.size() == 4) {
+        cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
+             ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+    } else {
+        return false;
+    }
+
+    return (cp >= 0x3400 && cp <= 0x4DBF) ||
+           (cp >= 0x4E00 && cp <= 0x9FFF) ||
+           (cp >= 0xF900 && cp <= 0xFAFF) ||
+           (cp >= 0x20000 && cp <= 0x2A6DF) ||
+           (cp >= 0x2A700 && cp <= 0x2B73F) ||
+           (cp >= 0x2B740 && cp <= 0x2B81F) ||
+           (cp >= 0x2B820 && cp <= 0x2CEAF) ||
+           (cp >= 0x2CEB0 && cp <= 0x2EBEF) ||
+           (cp >= 0x3000 && cp <= 0x303F) ||
+           (cp >= 0x3040 && cp <= 0x30FF) ||
+           (cp >= 0x31F0 && cp <= 0x31FF);
+}
+
+static bool contains_cjk_text(const std::string & text) {
+    for (const auto & ch : split_utf8_chars(text)) {
+        if (utf8_char_is_cjk(ch)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<std::string> tokenize_whitespace_words(const std::string & text) {
+    std::vector<std::string> words;
+    size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
+                                   text[i] == '\n' || text[i] == '\r')) ++i;
+        if (i >= text.size()) break;
+        size_t start = i;
+        while (i < text.size() && text[i] != ' ' && text[i] != '\t' &&
+               text[i] != '\n' && text[i] != '\r') ++i;
+        words.push_back(text.substr(start, i - start));
+    }
+    return words;
+}
+
+static std::vector<std::string> tokenize_cjk_chars(const std::string & text) {
+    std::vector<std::string> words;
+    std::string word;
+    for (const auto & unit : split_utf8_chars(text)) {
+        if (is_utf8_whitespace_char(unit)) {
+            if (!word.empty()) {
+                words.push_back(word);
+                word.clear();
+            }
+        } else if (utf8_char_is_cjk(unit)) {
+            if (!word.empty()) {
+                words.push_back(word);
+                word.clear();
+            }
+            words.push_back(unit);
+        } else {
+            word += unit;
+        }
+    }
+    if (!word.empty()) {
+        words.push_back(word);
+    }
+    return words;
+}
+
 std::vector<std::string> tokenize_korean(const std::string & text,
                                           const std::unordered_set<std::string> & ko_dict) {
     const float default_score = 0.0f;
 
-    std::vector<std::string> whitespace_words;
-    {
-        size_t i = 0;
-        while (i < text.size()) {
-            while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
-                                        text[i] == '\n' || text[i] == '\r')) ++i;
-            if (i >= text.size()) break;
-            size_t start = i;
-            while (i < text.size() && text[i] != ' ' && text[i] != '\t' &&
-                   text[i] != '\n' && text[i] != '\r') ++i;
-            whitespace_words.push_back(text.substr(start, i - start));
-        }
-    }
+    std::vector<std::string> whitespace_words = tokenize_whitespace_words(text);
 
     std::vector<std::string> result;
 
@@ -1598,24 +1688,17 @@ std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
 
     words.clear();
     std::vector<int32_t> tokens;
+    const std::string normalized_language = normalize_alignment_language(language);
 
     std::vector<std::string> raw_words;
 
-    if (language == "korean" && !model_.ko_dict.empty()) {
+    if (normalized_language == "korean" && !model_.ko_dict.empty()) {
         raw_words = tokenize_korean(text, model_.ko_dict);
-    } else if (language == "chinese" || language == "zh") {
-        raw_words = split_utf8_chars(text);
+    } else if (normalized_language == "chinese" || normalized_language == "japanese" ||
+               (normalized_language.empty() && contains_cjk_text(text))) {
+        raw_words = tokenize_cjk_chars(text);
     } else {
-        size_t i = 0;
-        while (i < text.size()) {
-            while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
-                                        text[i] == '\n' || text[i] == '\r')) ++i;
-            if (i >= text.size()) break;
-            size_t start = i;
-            while (i < text.size() && text[i] != ' ' && text[i] != '\t' &&
-                   text[i] != '\n' && text[i] != '\r') ++i;
-            raw_words.push_back(text.substr(start, i - start));
-        }
+        raw_words = tokenize_whitespace_words(text);
     }
 
     for (const auto & raw_word : raw_words) {
@@ -1682,7 +1765,7 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
     generate_mel_filters(mel_filters, QWEN_N_MELS, QWEN_N_FFT, QWEN_SAMPLE_RATE);
     
     MelSpectrogram mel;
-    if (!log_mel_spectrogram(samples, n_samples, mel_filters, mel, 4)) {
+    if (!log_mel_spectrogram(samples, n_samples, mel_filters, mel, n_threads_)) {
         result.error_msg = "Failed to compute mel spectrogram";
         return result;
     }
@@ -1760,10 +1843,8 @@ void free_forced_aligner_model(forced_aligner_model & model) {
         ggml_free(model.ctx);
         model.ctx = nullptr;
     }
-    if (model.mmap_addr) {
-        munmap(model.mmap_addr, model.mmap_size);
-        model.mmap_addr = nullptr;
-        model.mmap_size = 0;
+    if (model.mmap.addr) {
+        unmap_file(model.mmap);
     }
     model.tensors.clear();
     model.encoder_layers.clear();

@@ -5,6 +5,7 @@
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <gguf.h>
+#include "platform_mmap.h"
 #include <string>
 #include <map>
 #include <unordered_map>
@@ -152,8 +153,7 @@ struct forced_aligner_model {
     ggml_backend_buffer_t buffer = nullptr;
     
     // mmap state — must outlive all tensors backed by this mapping
-    void * mmap_addr = nullptr;
-    size_t mmap_size = 0;
+    mapped_file_view mmap;
     
     // Tensor name mapping
     std::map<std::string, ggml_tensor *> tensors;
@@ -204,6 +204,7 @@ public:
     
     // Load model from GGUF file
     bool load_model(const std::string & model_path);
+    void set_n_threads(int n_threads);
     
     alignment_result align(const std::string & audio_path, const std::string & text,
                            const std::string & language = "");
@@ -280,6 +281,7 @@ private:
     
     bool model_loaded_ = false;
     std::string error_msg_;
+    int n_threads_ = 4;
 };
 
 // Free model resources

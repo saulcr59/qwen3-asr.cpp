@@ -1,0 +1,2 @@
+/usr/bin/ar qc libforced_aligner.a CMakeFiles/forced_aligner.dir/src/forced_aligner.cpp.o
+/usr/bin/ranlib libforced_aligner.a

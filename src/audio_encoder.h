@@ -24,6 +24,7 @@ public:
     ~AudioEncoder();
     
     bool load_model(const std::string & model_path);
+    void set_n_threads(int n_threads);
     
     bool encode(const float * mel_data, int n_mel, int n_frames, 
                 std::vector<float> & output);
