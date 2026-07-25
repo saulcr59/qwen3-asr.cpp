@@ -443,31 +443,49 @@ bool ForcedAligner::load_tensor_data(const std::string & path, gguf_context * ct
         if (sz > max_tensor_size) max_tensor_size = sz;
     }
 
+    // Decide where the model weights live:
+    //  * Discrete GPU (CUDA, Vulkan, ...): the weights MUST be uploaded into a device-local
+    //    buffer. Wrapping the mmap'd host pointer with ggml_backend_dev_buffer_from_host_ptr()
+    //    does not work for a discrete GPU - depending on the driver it either returns null or
+    //    yields a buffer the GPU cannot read, which then crashes at graph-compute time (e.g.
+    //    Vulkan on Windows / RTX 50xx, issue #12815). Only CUDA was handled before; Vulkan fell
+    //    into the host-ptr path below and crashed.
+    //  * Unified-memory GPU (Apple Silicon / Metal): host and device share memory, so we can
+    //    wrap the mmap'd weights with zero copy.
+    //  * CPU only: wrap the mmap'd weights directly.
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-    bool is_cuda = false;
+    bool gpu_is_unified = false;
     if (gpu_dev) {
         const char * dev_name = ggml_backend_dev_name(gpu_dev);
-        if (dev_name && (strstr(dev_name, "CUDA") != nullptr || strstr(dev_name, "cuda") != nullptr)) {
-            is_cuda = true;
+        // Apple Metal is the only unified-memory GPU backend exposed here.
+        if (dev_name && (strstr(dev_name, "Metal") != nullptr || strstr(dev_name, "Apple") != nullptr)) {
+            gpu_is_unified = true;
         }
     }
 
-    if (is_cuda) {
+    if (gpu_dev && !gpu_is_unified) {
+        // Discrete GPU: allocate device-local weights and upload the mmap'd data.
         ggml_backend_t backend = ggml_backend_dev_init(gpu_dev, nullptr);
-        model_.buffer = ggml_backend_alloc_ctx_tensors(model_.ctx, backend);
-        if (model_.buffer) {
-            ggml_backend_buffer_set_usage(model_.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            for (int64_t i = 0; i < n_tensors; ++i) {
-                const char * name = gguf_get_tensor_name(ctx, i);
-                size_t offset = gguf_get_tensor_offset(ctx, i);
-                auto it = model_.tensors.find(name);
-                if (it == model_.tensors.end()) continue;
-                ggml_backend_tensor_set(it->second, data_base + offset, 0, ggml_nbytes(it->second));
+        if (backend) {
+            model_.buffer = ggml_backend_alloc_ctx_tensors(model_.ctx, backend);
+            if (model_.buffer) {
+                ggml_backend_buffer_set_usage(model_.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                for (int64_t i = 0; i < n_tensors; ++i) {
+                    const char * name = gguf_get_tensor_name(ctx, i);
+                    size_t offset = gguf_get_tensor_offset(ctx, i);
+                    auto it = model_.tensors.find(name);
+                    if (it == model_.tensors.end()) continue;
+                    ggml_backend_tensor_set(it->second, data_base + offset, 0, ggml_nbytes(it->second));
+                }
             }
+            ggml_backend_free(backend);
         }
-        ggml_backend_free(backend);
-    } else {
-        if (gpu_dev) {
+        // If device allocation failed (e.g. out of VRAM), fall through to the host-pointer
+        // path below so alignment still runs on the CPU instead of crashing.
+    }
+
+    if (!model_.buffer) {
+        if (gpu_dev && gpu_is_unified) {
             model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
         }
         if (!model_.buffer) {
