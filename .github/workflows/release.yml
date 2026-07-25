@@ -147,7 +147,7 @@ jobs:
                     cp assets/korean_dict_jieba.dict pkg/assets/ || true
 
                     # flatten_bin_files.py resolves the build-tree symlinks, so the package keeps
-                    # only the fully-versioned libs (e.g. libggml.0.15.3.dylib) while the CLI/libs
+                    # only the fully-versioned libs (e.g. libggml.0.17.0.dylib) while the CLI/libs
                     # link against the SONAME (e.g. @rpath/libggml.0.dylib). Provide those SONAME
                     # names as real copies so they resolve - using copies rather than symlinks so it
                     # survives archivers/extractors that don't preserve symlinks.
