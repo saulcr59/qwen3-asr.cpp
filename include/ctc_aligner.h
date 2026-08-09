@@ -85,7 +85,7 @@ public:
 
 private:
     bool parse_hparams(gguf_context * ctx);
-    bool create_tensors();
+    bool create_tensors(gguf_context * ctx, ggml_context * meta_ctx);
     bool load_tensor_data(const std::string & path, gguf_context * ctx);
 
     // Runs the acoustic model and returns row-major [n_frames][vocab_size]

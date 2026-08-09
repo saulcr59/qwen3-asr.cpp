@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <limits>
 
@@ -28,6 +29,58 @@ ggml_tensor * add_channel_bias(ggml_context * ctx, ggml_tensor * cur, ggml_tenso
     return ggml_add(ctx, cur, ggml_reshape_2d(ctx, bias, 1, bias->ne[0]));
 }
 
+bool starts_with(const std::string & s, const char * prefix) {
+    const size_t n = strlen(prefix);
+    return s.size() >= n && s.compare(0, n, prefix) == 0;
+}
+
+// Maps a tensor name onto the single naming scheme the rest of this file uses.
+// Two converters produce this same architecture with identical shapes but
+// different names - our own scripts/convert_wav2vec2_ctc_to_gguf.py, and the
+// third-party GGUFs Subtitle Edit already downloads for its wav2vec2 aligners -
+// so accepting both means users can reuse a model they may already have.
+std::string canonical_tensor_name(const std::string & name) {
+    // cnn.<i>.conv.* / cnn.<i>.norm.* -> conv.<i>.*
+    if (starts_with(name, "cnn.")) {
+        const size_t dot = name.find('.', 4);
+        if (dot != std::string::npos) {
+            const std::string idx  = name.substr(4, dot - 4);
+            const std::string rest = name.substr(dot + 1);
+            if (starts_with(rest, "conv.")) return "conv." + idx + "." + rest.substr(5);
+            if (starts_with(rest, "norm.")) return "conv." + idx + ".norm." + rest.substr(5);
+        }
+        return name;
+    }
+
+    if (starts_with(name, "feat_proj.ln.")) {
+        return "feat_proj.norm." + name.substr(13);
+    }
+    if (starts_with(name, "enc.ln.")) {
+        return "encoder.norm." + name.substr(7);
+    }
+
+    // enc.<i>.* -> blk.<i>.*
+    if (starts_with(name, "enc.")) {
+        const size_t dot = name.find('.', 4);
+        if (dot == std::string::npos) return name;
+        const std::string idx  = name.substr(4, dot - 4);
+        const std::string rest = name.substr(dot + 1);
+        const std::string p    = "blk." + idx + ".";
+
+        if (starts_with(rest, "ln1."))          return p + "attn_norm." + rest.substr(4);
+        if (starts_with(rest, "ln2."))          return p + "ffn_norm."  + rest.substr(4);
+        if (starts_with(rest, "attn.q."))       return p + "attn_q."    + rest.substr(7);
+        if (starts_with(rest, "attn.k."))       return p + "attn_k."    + rest.substr(7);
+        if (starts_with(rest, "attn.v."))       return p + "attn_v."    + rest.substr(7);
+        if (starts_with(rest, "attn.out."))     return p + "attn_out."  + rest.substr(9);
+        if (starts_with(rest, "ffn.fc1."))      return p + "ffn_up."    + rest.substr(8);
+        if (starts_with(rest, "ffn.fc2."))      return p + "ffn_down."  + rest.substr(8);
+        return name;
+    }
+
+    return name;
+}
+
 } // namespace
 
 CtcAligner::CtcAligner() = default;
@@ -48,47 +101,79 @@ void CtcAligner::set_n_threads(int n_threads) {
 }
 
 bool CtcAligner::parse_hparams(gguf_context * ctx) {
-    const std::string arch = "wav2vec2-ctc";
-
-    auto get_u32 = [&](const char * suffix, int32_t def) -> int32_t {
-        int64_t idx = gguf_find_key(ctx, (arch + "." + suffix).c_str());
+    // Accept our own key names and the ones used by the third-party wav2vec2
+    // GGUFs (which keep the HuggingFace config spellings under a "wav2vec2."
+    // prefix), so either file loads without conversion.
+    auto find = [&](const char * a, const char * b) -> int64_t {
+        int64_t idx = gguf_find_key(ctx, a);
+        return idx >= 0 ? idx : gguf_find_key(ctx, b);
+    };
+    auto get_u32 = [&](const char * a, const char * b, int32_t def) -> int32_t {
+        int64_t idx = find(a, b);
         return idx < 0 ? def : (int32_t) gguf_get_val_u32(ctx, idx);
     };
-    auto get_f32 = [&](const char * suffix, float def) -> float {
-        int64_t idx = gguf_find_key(ctx, (arch + "." + suffix).c_str());
+    auto get_f32 = [&](const char * a, const char * b, float def) -> float {
+        int64_t idx = find(a, b);
         return idx < 0 ? def : gguf_get_val_f32(ctx, idx);
     };
-    auto get_i32_array = [&](const char * suffix, std::vector<int32_t> & out) -> bool {
-        int64_t idx = gguf_find_key(ctx, (arch + "." + suffix).c_str());
+
+    auto & hp = hparams_;
+    hp.hidden_size     = get_u32("wav2vec2-ctc.embedding_length", "wav2vec2.hidden_size", 1024);
+    hp.n_layers        = get_u32("wav2vec2-ctc.block_count", "wav2vec2.num_hidden_layers", 24);
+    hp.n_heads         = get_u32("wav2vec2-ctc.attention.head_count", "wav2vec2.num_attention_heads", 16);
+    hp.ffn_dim         = get_u32("wav2vec2-ctc.feed_forward_length", "wav2vec2.intermediate_size", 4096);
+    hp.layer_norm_eps  = get_f32("wav2vec2-ctc.attention.layer_norm_epsilon", "wav2vec2.layer_norm_eps", 1e-5f);
+    hp.vocab_size      = get_u32("wav2vec2-ctc.vocab_size", "wav2vec2.vocab_size", 2341);
+    hp.pos_conv_kernel = get_u32("wav2vec2-ctc.pos_conv.kernel", "wav2vec2.num_conv_pos_embeddings", 128);
+    hp.pos_conv_groups = get_u32("wav2vec2-ctc.pos_conv.groups", "wav2vec2.num_conv_pos_embedding_groups", 16);
+    hp.sample_rate     = get_u32("wav2vec2-ctc.sample_rate", "wav2vec2.sample_rate", 16000);
+    hp.blank_id        = get_u32("wav2vec2-ctc.blank_token_id", "wav2vec2.pad_token_id", 0);
+
+    // This implementation only covers the layer-norm / stable-layer-norm variant
+    // (the large XLSR family); the group-norm variant places its normalisation
+    // differently and would silently produce wrong emissions.
+    int64_t stable_idx = gguf_find_key(ctx, "wav2vec2.do_stable_layer_norm");
+    if (stable_idx >= 0 && gguf_get_val_u32(ctx, stable_idx) == 0) {
+        error_msg_ = "Unsupported CTC model: only the stable-layer-norm wav2vec2 variant is implemented";
+        return false;
+    }
+
+    // Conv stack: either three arrays (ours) or one key per layer (theirs).
+    auto get_i32_array = [&](const char * key, std::vector<int32_t> & out) -> bool {
+        int64_t idx = gguf_find_key(ctx, key);
         if (idx < 0 || gguf_get_kv_type(ctx, idx) != GGUF_TYPE_ARRAY) {
             return false;
         }
         const int32_t * data = (const int32_t *) gguf_get_arr_data(ctx, idx);
-        size_t n = gguf_get_arr_n(ctx, idx);
-        out.assign(data, data + n);
+        out.assign(data, data + gguf_get_arr_n(ctx, idx));
         return true;
     };
 
-    auto & hp = hparams_;
-    hp.hidden_size    = get_u32("embedding_length", 1024);
-    hp.n_layers       = get_u32("block_count", 24);
-    hp.n_heads        = get_u32("attention.head_count", 16);
-    hp.ffn_dim        = get_u32("feed_forward_length", 4096);
-    hp.layer_norm_eps = get_f32("attention.layer_norm_epsilon", 1e-5f);
-    hp.vocab_size     = get_u32("vocab_size", 2341);
-    hp.pos_conv_kernel = get_u32("pos_conv.kernel", 128);
-    hp.pos_conv_groups = get_u32("pos_conv.groups", 16);
-    hp.sample_rate     = get_u32("sample_rate", 16000);
-    hp.blank_id        = get_u32("blank_token_id", 0);
-
-    if (!get_i32_array("conv.dim", hp.conv_dim) ||
-        !get_i32_array("conv.stride", hp.conv_stride) ||
-        !get_i32_array("conv.kernel", hp.conv_kernel)) {
-        error_msg_ = "CTC model is missing the conv.dim/stride/kernel arrays";
-        return false;
+    if (!get_i32_array("wav2vec2-ctc.conv.dim", hp.conv_dim) ||
+        !get_i32_array("wav2vec2-ctc.conv.stride", hp.conv_stride) ||
+        !get_i32_array("wav2vec2-ctc.conv.kernel", hp.conv_kernel)) {
+        const int32_t n_conv = get_u32("wav2vec2-ctc.conv.count", "wav2vec2.num_feat_extract_layers", 0);
+        if (n_conv <= 0) {
+            error_msg_ = "CTC model does not describe its convolutional feature encoder";
+            return false;
+        }
+        hp.conv_dim.clear(); hp.conv_stride.clear(); hp.conv_kernel.clear();
+        for (int32_t i = 0; i < n_conv; ++i) {
+            const std::string s = std::to_string(i);
+            int64_t d = gguf_find_key(ctx, ("wav2vec2.conv_dim_" + s).c_str());
+            int64_t k = gguf_find_key(ctx, ("wav2vec2.conv_kernel_" + s).c_str());
+            int64_t t = gguf_find_key(ctx, ("wav2vec2.conv_stride_" + s).c_str());
+            if (d < 0 || k < 0 || t < 0) {
+                error_msg_ = "CTC model is missing conv parameters for layer " + s;
+                return false;
+            }
+            hp.conv_dim.push_back((int32_t) gguf_get_val_u32(ctx, d));
+            hp.conv_kernel.push_back((int32_t) gguf_get_val_u32(ctx, k));
+            hp.conv_stride.push_back((int32_t) gguf_get_val_u32(ctx, t));
+        }
     }
     if (hp.conv_dim.size() != hp.conv_stride.size() || hp.conv_dim.size() != hp.conv_kernel.size()) {
-        error_msg_ = "CTC model conv arrays have mismatched lengths";
+        error_msg_ = "CTC model conv parameters have mismatched lengths";
         return false;
     }
     if (hp.hidden_size % hp.n_heads != 0) {
@@ -114,14 +199,11 @@ bool CtcAligner::parse_hparams(gguf_context * ctx) {
     return true;
 }
 
-bool CtcAligner::create_tensors() {
-    const auto & hp = hparams_;
-    const size_t n_conv = hp.conv_dim.size();
-    const size_t n_tensors = n_conv * 4 + 4 /*feat_proj*/ + 2 /*pos_conv*/ + 2 /*enc norm*/
-                              + (size_t) hp.n_layers * 16 + 2 /*lm_head*/;
+bool CtcAligner::create_tensors(gguf_context * ctx, ggml_context * meta_ctx) {
+    const int64_t n_tensors = gguf_get_n_tensors(ctx);
 
     ggml_init_params params = {
-        /*.mem_size   =*/ (n_tensors + 8) * ggml_tensor_overhead(),
+        /*.mem_size   =*/ (size_t) (n_tensors + 8) * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -131,70 +213,91 @@ bool CtcAligner::create_tensors() {
         return false;
     }
 
-    auto reg = [&](ggml_tensor * t, const std::string & name) {
+    // Mirror each tensor exactly as stored - same shape, same type - so a
+    // quantised checkpoint needs no conversion here: ggml_mul_mat consumes the
+    // quantised matrices directly, and the convolutions are stored unquantised.
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char * src_name = gguf_get_tensor_name(ctx, i);
+        ggml_tensor * meta = ggml_get_tensor(meta_ctx, src_name);
+        if (!meta) {
+            error_msg_ = std::string("Missing metadata for tensor '") + src_name + "'";
+            return false;
+        }
+        const std::string name = canonical_tensor_name(src_name);
+        if (tensors_.count(name)) {
+            error_msg_ = "Duplicate tensor '" + name + "' in CTC model";
+            return false;
+        }
+        ggml_tensor * t = ggml_dup_tensor(model_ctx_, meta);
         ggml_set_name(t, name.c_str());
         tensors_[name] = t;
-        return t;
-    };
-    auto new_1d = [&](int64_t n) { return ggml_new_tensor_1d(model_ctx_, GGML_TYPE_F32, n); };
-    auto new_2d = [&](int64_t a, int64_t b) { return ggml_new_tensor_2d(model_ctx_, GGML_TYPE_F16, a, b); };
-
-    conv_layers_.resize(n_conv);
-    for (size_t i = 0; i < n_conv; ++i) {
-        const int64_t in_ch = (i == 0) ? 1 : hp.conv_dim[i - 1];
-        const std::string p = "conv." + std::to_string(i);
-        conv_layers_[i].w = reg(ggml_new_tensor_3d(model_ctx_, GGML_TYPE_F16,
-                                 hp.conv_kernel[i], in_ch, hp.conv_dim[i]), p + ".weight");
-        conv_layers_[i].b      = reg(new_1d(hp.conv_dim[i]), p + ".bias");
-        conv_layers_[i].norm_w = reg(new_1d(hp.conv_dim[i]), p + ".norm.weight");
-        conv_layers_[i].norm_b = reg(new_1d(hp.conv_dim[i]), p + ".norm.bias");
     }
-
-    const int64_t last_conv_dim = hp.conv_dim.back();
-    feat_proj_norm_w_ = reg(new_1d(last_conv_dim), "feat_proj.norm.weight");
-    feat_proj_norm_b_ = reg(new_1d(last_conv_dim), "feat_proj.norm.bias");
-    feat_proj_w_      = reg(new_2d(last_conv_dim, hp.hidden_size), "feat_proj.weight");
-    feat_proj_b_      = reg(new_1d(hp.hidden_size), "feat_proj.bias");
-
-    pos_conv_w_ = reg(ggml_new_tensor_3d(model_ctx_, GGML_TYPE_F16,
-                       hp.pos_conv_kernel, hp.hidden_size / hp.pos_conv_groups, hp.hidden_size),
-                       "pos_conv.weight");
-    pos_conv_b_ = reg(new_1d(hp.hidden_size), "pos_conv.bias");
-
-    enc_norm_w_ = reg(new_1d(hp.hidden_size), "encoder.norm.weight");
-    enc_norm_b_ = reg(new_1d(hp.hidden_size), "encoder.norm.bias");
-
-    layers_.resize(hp.n_layers);
-    for (int32_t i = 0; i < hp.n_layers; ++i) {
-        const std::string p = "blk." + std::to_string(i);
-        auto & l = layers_[i];
-        l.attn_norm_w = reg(new_1d(hp.hidden_size), p + ".attn_norm.weight");
-        l.attn_norm_b = reg(new_1d(hp.hidden_size), p + ".attn_norm.bias");
-        l.attn_q_w    = reg(new_2d(hp.hidden_size, hp.hidden_size), p + ".attn_q.weight");
-        l.attn_q_b    = reg(new_1d(hp.hidden_size), p + ".attn_q.bias");
-        l.attn_k_w    = reg(new_2d(hp.hidden_size, hp.hidden_size), p + ".attn_k.weight");
-        l.attn_k_b    = reg(new_1d(hp.hidden_size), p + ".attn_k.bias");
-        l.attn_v_w    = reg(new_2d(hp.hidden_size, hp.hidden_size), p + ".attn_v.weight");
-        l.attn_v_b    = reg(new_1d(hp.hidden_size), p + ".attn_v.bias");
-        l.attn_out_w  = reg(new_2d(hp.hidden_size, hp.hidden_size), p + ".attn_out.weight");
-        l.attn_out_b  = reg(new_1d(hp.hidden_size), p + ".attn_out.bias");
-        l.ffn_norm_w  = reg(new_1d(hp.hidden_size), p + ".ffn_norm.weight");
-        l.ffn_norm_b  = reg(new_1d(hp.hidden_size), p + ".ffn_norm.bias");
-        l.ffn_up_w    = reg(new_2d(hp.hidden_size, hp.ffn_dim), p + ".ffn_up.weight");
-        l.ffn_up_b    = reg(new_1d(hp.ffn_dim), p + ".ffn_up.bias");
-        l.ffn_down_w  = reg(new_2d(hp.ffn_dim, hp.hidden_size), p + ".ffn_down.weight");
-        l.ffn_down_b  = reg(new_1d(hp.hidden_size), p + ".ffn_down.bias");
-    }
-
-    lm_head_w_ = reg(new_2d(hp.hidden_size, hp.vocab_size), "lm_head.weight");
-    lm_head_b_ = reg(new_1d(hp.vocab_size), "lm_head.bias");
 
     model_buffer_ = ggml_backend_alloc_ctx_tensors(model_ctx_, backend_cpu_);
     if (!model_buffer_) {
         error_msg_ = "Failed to allocate CTC model tensors";
         return false;
     }
-    return true;
+
+    auto need = [&](const std::string & n) -> ggml_tensor * {
+        auto it = tensors_.find(n);
+        if (it == tensors_.end()) {
+            if (error_msg_.empty()) {
+                error_msg_ = "CTC model is missing tensor '" + n + "'";
+            }
+            return nullptr;
+        }
+        return it->second;
+    };
+
+    const auto & hp = hparams_;
+
+    conv_layers_.resize(hp.conv_dim.size());
+    for (size_t i = 0; i < conv_layers_.size(); ++i) {
+        const std::string p = "conv." + std::to_string(i);
+        conv_layers_[i].w      = need(p + ".weight");
+        conv_layers_[i].b      = need(p + ".bias");
+        conv_layers_[i].norm_w = need(p + ".norm.weight");
+        conv_layers_[i].norm_b = need(p + ".norm.bias");
+    }
+
+    feat_proj_norm_w_ = need("feat_proj.norm.weight");
+    feat_proj_norm_b_ = need("feat_proj.norm.bias");
+    feat_proj_w_      = need("feat_proj.weight");
+    feat_proj_b_      = need("feat_proj.bias");
+
+    pos_conv_w_ = need("pos_conv.weight");
+    pos_conv_b_ = need("pos_conv.bias");
+
+    enc_norm_w_ = need("encoder.norm.weight");
+    enc_norm_b_ = need("encoder.norm.bias");
+
+    layers_.resize(hp.n_layers);
+    for (int32_t i = 0; i < hp.n_layers; ++i) {
+        const std::string p = "blk." + std::to_string(i);
+        auto & l = layers_[i];
+        l.attn_norm_w = need(p + ".attn_norm.weight");
+        l.attn_norm_b = need(p + ".attn_norm.bias");
+        l.attn_q_w    = need(p + ".attn_q.weight");
+        l.attn_q_b    = need(p + ".attn_q.bias");
+        l.attn_k_w    = need(p + ".attn_k.weight");
+        l.attn_k_b    = need(p + ".attn_k.bias");
+        l.attn_v_w    = need(p + ".attn_v.weight");
+        l.attn_v_b    = need(p + ".attn_v.bias");
+        l.attn_out_w  = need(p + ".attn_out.weight");
+        l.attn_out_b  = need(p + ".attn_out.bias");
+        l.ffn_norm_w  = need(p + ".ffn_norm.weight");
+        l.ffn_norm_b  = need(p + ".ffn_norm.bias");
+        l.ffn_up_w    = need(p + ".ffn_up.weight");
+        l.ffn_up_b    = need(p + ".ffn_up.bias");
+        l.ffn_down_w  = need(p + ".ffn_down.weight");
+        l.ffn_down_b  = need(p + ".ffn_down.bias");
+    }
+
+    lm_head_w_ = need("lm_head.weight");
+    lm_head_b_ = need("lm_head.bias");
+
+    return error_msg_.empty();
 }
 
 bool CtcAligner::load_tensor_data(const std::string & path, gguf_context * ctx) {
@@ -210,23 +313,14 @@ bool CtcAligner::load_tensor_data(const std::string & path, gguf_context * ctx) 
     std::vector<char> buf;
     size_t n_loaded = 0;
     for (int64_t i = 0; i < n_tensors; ++i) {
-        const char * name = gguf_get_tensor_name(ctx, i);
+        const char * src_name = gguf_get_tensor_name(ctx, i);
+        const std::string name = canonical_tensor_name(src_name);
         auto it = tensors_.find(name);
         if (it == tensors_.end()) {
-            error_msg_ = std::string("Unexpected tensor '") + name + "' in CTC model";
+            error_msg_ = std::string("Unexpected tensor '") + src_name + "' in CTC model";
             return false;
         }
         ggml_tensor * dst = it->second;
-
-        const int64_t * ne = gguf_get_tensor_ne(ctx, i);
-        if (ne[0] != dst->ne[0] || ne[1] != dst->ne[1] || ne[2] != dst->ne[2]) {
-            error_msg_ = std::string("Tensor '") + name + "' has an unexpected shape in the CTC model";
-            return false;
-        }
-        if (gguf_get_tensor_type(ctx, i) != dst->type) {
-            error_msg_ = std::string("Tensor '") + name + "' has an unexpected type in the CTC model";
-            return false;
-        }
 
         const size_t nbytes = ggml_nbytes(dst);
         buf.resize(nbytes);
@@ -267,7 +361,7 @@ bool CtcAligner::load_model(const std::string & model_path) {
             ok = false;
         }
     }
-    if (ok) ok = create_tensors();
+    if (ok) ok = create_tensors(ctx, meta_ctx);
     if (ok) ok = load_tensor_data(model_path, ctx);
 
     gguf_free(ctx);
