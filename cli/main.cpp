@@ -572,6 +572,42 @@ static int run_transcription(const cli_params & params) {
     return 0;
 }
 
+// The ASR model can lock into a repetition loop on wordless vocalisation - a
+// scream, laughter - and emit the same character hundreds of times in a row.
+// Qwen's own Qwen3-ASR-Toolkit collapses these before the text is used, and the
+// same applies here for a second reason: left in, the aligner has to spread a
+// meaningless run across the whole passage, which drags the surrounding
+// timestamps with it.
+static std::string collapse_repeated_chars(const std::string & text, int threshold = 20) {
+    std::vector<std::string> chars;
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = (unsigned char) text[i];
+        size_t len = 1;
+        if      ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        len = std::min(len, text.size() - i);
+        chars.push_back(text.substr(i, len));
+        i += len;
+    }
+
+    std::string out;
+    size_t i = 0;
+    while (i < chars.size()) {
+        size_t run = 1;
+        while (i + run < chars.size() && chars[i + run] == chars[i]) {
+            run++;
+        }
+        // A genuine repetition is short (ええ, ーー); a loop is not.
+        const size_t keep = (run > (size_t) threshold) ? 1 : run;
+        for (size_t k = 0; k < keep; ++k) {
+            out += chars[i];
+        }
+        i += run;
+    }
+    return out;
+}
+
 // Splits a transcript the same way the Qwen aligner does, so switching aligners
 // doesn't change the granularity of the JSON/SRT that consumers already parse:
 // each CJK character stands alone (those scripts have no word separators), while
@@ -796,7 +832,7 @@ static int run_transcribe_and_align(const cli_params & params) {
         }
         
         std::string align_lang = global_lang.empty() ? detected_lang : global_lang;
-        std::string transcript = extract_transcript(asr_result.text);
+        std::string transcript = collapse_repeated_chars(extract_transcript(asr_result.text));
         
         fprintf(stderr, "  Detected language: %s\n", detected_lang.empty() ? "(none)" : detected_lang.c_str());
         fprintf(stderr, "  Alignment language: %s\n", align_lang.empty() ? "(none)" : align_lang.c_str());
