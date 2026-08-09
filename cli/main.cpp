@@ -1,5 +1,6 @@
 #include "qwen3_asr.h"
 #include "forced_aligner.h"
+#include "ctc_aligner.h"
 #include "vad.h"
 #include "timing.h"
 
@@ -24,6 +25,7 @@
 struct cli_params {
     std::string model_path = "models/qwen3-asr-0.6b-f16.gguf";
     std::string aligner_model_path = "";
+    std::string ctc_aligner_model_path = "";
     std::string vad_model_path = "";
     std::string audio_path = "";
     std::string output_path = "";
@@ -62,6 +64,8 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "Transcribe + Align:\n");
     fprintf(stderr, "  -a, --transcribe-align Run ASR then forced alignment\n");
     fprintf(stderr, "  --aligner-model <path> Path to forced aligner GGUF model (required with --transcribe-align)\n");
+    fprintf(stderr, "  --ctc-align-model <p>  Path to a wav2vec2 CTC GGUF model. Used instead of --aligner-model to\n");
+    fprintf(stderr, "                         time the transcript, via monotonic CTC alignment (no timestamp jumps).\n");
     fprintf(stderr, "  --vad-model <path>     Path to ggml Silero VAD model. When given, long audio is split into\n");
     fprintf(stderr, "                         chunks at detected silence instead of fixed 30s/2s-overlap windows.\n");
     fprintf(stderr, "\n");
@@ -141,6 +145,12 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
                 return false;
             }
             params.aligner_model_path = argv[++i];
+        } else if (strcmp(arg, "--ctc-align-model") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: %s requires an argument\n", arg);
+                return false;
+            }
+            params.ctc_aligner_model_path = argv[++i];
         } else if (strcmp(arg, "--vad-model") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Error: %s requires an argument\n", arg);
@@ -177,8 +187,8 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         return false;
     }
 
-    if (params.transcribe_align_mode && params.aligner_model_path.empty()) {
-        fprintf(stderr, "Error: --aligner-model is required for --transcribe-align\n");
+    if (params.transcribe_align_mode && params.aligner_model_path.empty() && params.ctc_aligner_model_path.empty()) {
+        fprintf(stderr, "Error: --transcribe-align needs an aligner: --aligner-model or --ctc-align-model\n");
         return false;
     }
     
@@ -562,6 +572,52 @@ static int run_transcription(const cli_params & params) {
     return 0;
 }
 
+// Splits a transcript the same way the Qwen aligner does, so switching aligners
+// doesn't change the granularity of the JSON/SRT that consumers already parse:
+// each CJK character stands alone (those scripts have no word separators), while
+// runs of Latin text stay together as one token.
+static std::vector<std::string> split_transcript_tokens(const std::string & text) {
+    auto is_cjk = [](uint32_t cp) {
+        return (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) ||
+               (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x3000 && cp <= 0x303F) ||
+               (cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x31F0 && cp <= 0x31FF) ||
+               (cp >= 0xFF00 && cp <= 0xFF65) || (cp >= 0x20000 && cp <= 0x2A6DF);
+    };
+
+    std::vector<std::string> out;
+    std::string pending;
+    size_t i = 0;
+    while (i < text.size()) {
+        const unsigned char c = (unsigned char) text[i];
+        size_t len = 1;
+        if      ((c & 0x80) == 0x00) len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        len = std::min(len, text.size() - i);
+
+        uint32_t cp = 0;
+        if (len == 1) cp = c;
+        else if (len == 2) cp = ((c & 0x1F) << 6) | (text[i + 1] & 0x3F);
+        else if (len == 3) cp = ((c & 0x0F) << 12) | ((text[i + 1] & 0x3F) << 6) | (text[i + 2] & 0x3F);
+        else              cp = ((c & 0x07) << 18) | ((text[i + 1] & 0x3F) << 12) |
+                                ((text[i + 2] & 0x3F) << 6) | (text[i + 3] & 0x3F);
+
+        const std::string unit = text.substr(i, len);
+        i += len;
+
+        const bool is_space = (len == 1 && isspace(c)) || cp == 0x3000;
+        if (is_space || is_cjk(cp)) {
+            if (!pending.empty()) { out.push_back(pending); pending.clear(); }
+            if (!is_space) out.push_back(unit);
+        } else {
+            pending += unit;
+        }
+    }
+    if (!pending.empty()) out.push_back(pending);
+    return out;
+}
+
 // Builds non-overlapping [start, end) sample ranges covering the whole signal, each
 // no longer than max_chunk_samples (the ASR/aligner models' ~30s hard window limit).
 // Cuts are placed at the midpoint of a detected silence gap whenever one is available
@@ -613,7 +669,9 @@ static std::vector<std::pair<int, int>> build_vad_chunk_ranges(
 static int run_transcribe_and_align(const cli_params & params) {
     fprintf(stderr, "qwen3-asr-cli (Transcribe + Align Mode)\n");
     fprintf(stderr, "  ASR Model: %s\n", params.model_path.c_str());
-    fprintf(stderr, "  Aligner Model: %s\n", params.aligner_model_path.c_str());
+    fprintf(stderr, "  Aligner Model: %s\n", params.ctc_aligner_model_path.empty()
+            ? params.aligner_model_path.c_str()
+            : (params.ctc_aligner_model_path + " (CTC)").c_str());
     fprintf(stderr, "  Audio: %s\n", params.audio_path.c_str());
     fprintf(stderr, "  Threads: %d\n", params.n_threads);
     fprintf(stderr, "\n");
@@ -624,12 +682,29 @@ static int run_transcribe_and_align(const cli_params & params) {
         return 1;
     }
 
+    // Two interchangeable timing back-ends. CTC alignment is monotonic by
+    // construction so it cannot leave a multi-second hole in the middle of
+    // continuous speech, which the autoregressive aligner occasionally does;
+    // the Qwen aligner in turn is multilingual from a single model. Either way
+    // the transcript text always comes from the ASR model above.
+    const bool use_ctc = !params.ctc_aligner_model_path.empty();
+
     qwen3_asr::ForcedAligner aligner;
-    if (!aligner.load_model(params.aligner_model_path)) {
-        fprintf(stderr, "Error (Aligner): %s\n", aligner.get_error().c_str());
-        return 1;
+    qwen3_asr::CtcAligner ctc_aligner;
+
+    if (use_ctc) {
+        if (!ctc_aligner.load_model(params.ctc_aligner_model_path)) {
+            fprintf(stderr, "Error (CTC Aligner): %s\n", ctc_aligner.get_error().c_str());
+            return 1;
+        }
+        ctc_aligner.set_n_threads(params.n_threads);
+    } else {
+        if (!aligner.load_model(params.aligner_model_path)) {
+            fprintf(stderr, "Error (Aligner): %s\n", aligner.get_error().c_str());
+            return 1;
+        }
+        aligner.set_n_threads(params.n_threads);
     }
-    aligner.set_n_threads(params.n_threads);
 
     std::vector<float> all_samples;
     int sample_rate;
@@ -683,7 +758,7 @@ static int run_transcribe_and_align(const cli_params & params) {
     int64_t total_align_ms = 0;
 
     std::string global_lang = normalize_language_name(params.language);
-    if (global_lang == "korean") {
+    if (!use_ctc && global_lang == "korean") {
         std::string dict_path = find_korean_dict(params.aligner_model_path);
         if (!dict_path.empty()) {
             aligner.load_korean_dict(dict_path);
@@ -714,7 +789,7 @@ static int run_transcribe_and_align(const cli_params & params) {
         std::string detected_lang = detect_language(asr_result.language);
         if (global_lang.empty() && !detected_lang.empty()) {
             global_lang = detected_lang;
-            if (global_lang == "korean") {
+            if (!use_ctc && global_lang == "korean") {
                 std::string dict_path = find_korean_dict(params.aligner_model_path);
                 if (!dict_path.empty()) aligner.load_korean_dict(dict_path);
             }
@@ -729,7 +804,13 @@ static int run_transcribe_and_align(const cli_params & params) {
         
         if (transcript.empty()) continue;
 
-        auto align_result = aligner.align(all_samples.data() + start, chunk_len, transcript, align_lang);
+        qwen3_asr::alignment_result align_result;
+        if (use_ctc) {
+            align_result = ctc_aligner.align(all_samples.data() + start, chunk_len,
+                                              split_transcript_tokens(transcript));
+        } else {
+            align_result = aligner.align(all_samples.data() + start, chunk_len, transcript, align_lang);
+        }
         if (!align_result.success) {
             fprintf(stderr, "Error (Aligner) in chunk %d: %s\n", c + 1, align_result.error_msg.c_str());
             continue;
