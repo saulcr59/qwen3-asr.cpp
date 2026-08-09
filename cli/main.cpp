@@ -711,6 +711,12 @@ static void ggml_log_callback_quiet(enum ggml_log_level level, const char * text
 
 static void configure_console_utf8() {
     std::setlocale(LC_ALL, ".UTF-8");
+    // On Windows, ".UTF-8" only changes the codepage; LC_NUMERIC still follows the
+    // user's regional settings. In locales that use ',' as the decimal separator,
+    // this makes "%.3f"-style formatting (timestamps, JSON output) emit commas
+    // instead of periods, which breaks strict JSON parsers. Force '.' regardless
+    // of the user's region.
+    std::setlocale(LC_NUMERIC, "C");
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
