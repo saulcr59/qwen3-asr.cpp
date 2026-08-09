@@ -1,5 +1,6 @@
 #include "qwen3_asr.h"
 #include "forced_aligner.h"
+#include "vad.h"
 #include "timing.h"
 
 #include <ggml.h>
@@ -23,6 +24,7 @@
 struct cli_params {
     std::string model_path = "models/qwen3-asr-0.6b-f16.gguf";
     std::string aligner_model_path = "";
+    std::string vad_model_path = "";
     std::string audio_path = "";
     std::string output_path = "";
     std::string language = "";
@@ -60,6 +62,8 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "Transcribe + Align:\n");
     fprintf(stderr, "  -a, --transcribe-align Run ASR then forced alignment\n");
     fprintf(stderr, "  --aligner-model <path> Path to forced aligner GGUF model (required with --transcribe-align)\n");
+    fprintf(stderr, "  --vad-model <path>     Path to ggml Silero VAD model. When given, long audio is split into\n");
+    fprintf(stderr, "                         chunks at detected silence instead of fixed 30s/2s-overlap windows.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Output Formats:\n");
     fprintf(stderr, "  -osrt, --output-srt    Output result in a SRT file\n");
@@ -137,6 +141,12 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
                 return false;
             }
             params.aligner_model_path = argv[++i];
+        } else if (strcmp(arg, "--vad-model") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: %s requires an argument\n", arg);
+                return false;
+            }
+            params.vad_model_path = argv[++i];
         } else if (strcmp(arg, "--text") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Error: %s requires an argument\n", arg);
@@ -552,6 +562,54 @@ static int run_transcription(const cli_params & params) {
     return 0;
 }
 
+// Builds non-overlapping [start, end) sample ranges covering the whole signal, each
+// no longer than max_chunk_samples (the ASR/aligner models' ~30s hard window limit).
+// Cuts are placed at the midpoint of a detected silence gap whenever one is available
+// in range, so a chunk boundary never lands in the middle of a word or sentence. Only
+// falls back to a hard cut at max_chunk_samples when a single speech segment alone
+// exceeds that limit (no silence to cut at).
+static std::vector<std::pair<int, int>> build_vad_chunk_ranges(
+        const std::vector<qwen3_asr::vad_segment> & speech, int total_samples, int max_chunk_samples) {
+    std::vector<std::pair<int, int>> chunks;
+    if (total_samples <= max_chunk_samples) {
+        chunks.push_back({0, total_samples});
+        return chunks;
+    }
+
+    std::vector<int> cut_points;
+    for (size_t i = 0; i + 1 < speech.size(); ++i) {
+        int gap_start = (int) std::lround(speech[i].end * 16000.0);
+        int gap_end = (int) std::lround(speech[i + 1].start * 16000.0);
+        if (gap_end > gap_start) {
+            cut_points.push_back((gap_start + gap_end) / 2);
+        }
+    }
+
+    int chunk_start = 0;
+    while (chunk_start < total_samples) {
+        int hard_limit = std::min(total_samples, chunk_start + max_chunk_samples);
+        if (hard_limit >= total_samples) {
+            chunks.push_back({chunk_start, total_samples});
+            break;
+        }
+
+        int best_cut = -1;
+        for (int cp : cut_points) {
+            if (cp > chunk_start && cp <= hard_limit) {
+                best_cut = cp; // cut_points is ascending: keep advancing to the latest valid one
+            } else if (cp > hard_limit) {
+                break;
+            }
+        }
+
+        int cut = (best_cut > chunk_start) ? best_cut : hard_limit;
+        chunks.push_back({chunk_start, cut});
+        chunk_start = cut;
+    }
+
+    return chunks;
+}
+
 static int run_transcribe_and_align(const cli_params & params) {
     fprintf(stderr, "qwen3-asr-cli (Transcribe + Align Mode)\n");
     fprintf(stderr, "  ASR Model: %s\n", params.model_path.c_str());
@@ -585,10 +643,38 @@ static int run_transcribe_and_align(const cli_params & params) {
     }
 
     const int chunk_size_samples = 30 * 16000;
-    const int chunk_stride_samples = 28 * 16000; // 2 seconds overlap
-    int n_chunks = (all_samples.size() > chunk_size_samples) 
-                   ? (all_samples.size() - chunk_size_samples + chunk_stride_samples - 1) / chunk_stride_samples + 1 
-                   : 1;
+    const int chunk_stride_samples = 28 * 16000; // 2 seconds overlap (legacy, fixed-window mode only)
+
+    // With --vad-model: cut only at real silence, chunks never overlap. Without it:
+    // fall back to the original fixed-size sliding window (kept for callers that
+    // don't have a VAD model available).
+    bool use_vad_chunking = !params.vad_model_path.empty();
+    std::vector<std::pair<int, int>> chunk_ranges;
+    std::vector<qwen3_asr::vad_segment> speech_segments; // kept for the post-alignment gap sanity check below
+
+    if (use_vad_chunking) {
+        qwen3_asr::VoiceActivityDetector vad;
+        if (!vad.load_model(params.vad_model_path)) {
+            fprintf(stderr, "Error (VAD): %s\n", vad.get_error().c_str());
+            return 1;
+        }
+        vad.set_n_threads(params.n_threads);
+
+        speech_segments = vad.detect_speech(all_samples.data(), (int) all_samples.size());
+        fprintf(stderr, "VAD: detected %zu speech segment(s)\n", speech_segments.size());
+
+        chunk_ranges = build_vad_chunk_ranges(speech_segments, (int) all_samples.size(), chunk_size_samples);
+    } else {
+        int n_chunks = (all_samples.size() > chunk_size_samples)
+                       ? (all_samples.size() - chunk_size_samples + chunk_stride_samples - 1) / chunk_stride_samples + 1
+                       : 1;
+        for (int c = 0; c < n_chunks; ++c) {
+            int start = c * chunk_stride_samples;
+            int end = std::min((int) all_samples.size(), start + chunk_size_samples);
+            chunk_ranges.push_back({start, end});
+        }
+    }
+    const int n_chunks = (int) chunk_ranges.size();
 
     qwen3_asr::alignment_result full_align_result;
     full_align_result.success = true;
@@ -605,8 +691,8 @@ static int run_transcribe_and_align(const cli_params & params) {
     }
 
     for (int c = 0; c < n_chunks; ++c) {
-        int start = c * chunk_stride_samples;
-        int end = std::min((int)all_samples.size(), start + chunk_size_samples);
+        int start = chunk_ranges[c].first;
+        int end = chunk_ranges[c].second;
         int chunk_len = end - start;
         
         fprintf(stderr, "\n--- Processing Chunk %d/%d (%.2fs - %.2fs) ---\n", 
@@ -650,18 +736,44 @@ static int run_transcribe_and_align(const cli_params & params) {
         }
 
         float time_offset = start / 16000.0f;
-        
-        // Define strict ownership boundaries for this chunk based on the overlapping stride
+
+        // Define strict ownership boundaries for this chunk. With VAD chunking, chunks are
+        // contiguous and non-overlapping, so a chunk simply owns everything up to its own end.
+        // With the legacy fixed-stride window, ownership stops at the start of the next
+        // chunk's stride to avoid double-counting words in the overlap region.
         double chunk_own_start = time_offset;
-        double chunk_own_end = (c == n_chunks - 1) ? 999999.0 : (time_offset + (chunk_stride_samples / 16000.0f));
+        double chunk_own_end;
+        if (c == n_chunks - 1) {
+            chunk_own_end = 999999.0;
+        } else if (use_vad_chunking) {
+            chunk_own_end = end / 16000.0f;
+        } else {
+            chunk_own_end = time_offset + (chunk_stride_samples / 16000.0f);
+        }
         
         for (auto & w : align_result.words) {
             double abs_start = w.start + time_offset;
             double abs_end = w.end + time_offset;
-            
+
             // Hard partitioning: This chunk only "owns" words that start within its active stride window.
             // This prevents trailing truncated words (e.g. "For your.") in Chunk N from duplicating with Chunk N+1.
             if (abs_start >= chunk_own_start && abs_start < chunk_own_end) {
+                // Only the legacy overlapping window can duplicate a word: there, chunk N and
+                // chunk N+1 both align the shared overlap audio independently, and when the true
+                // boundary between two words falls close to chunk_own_end each chunk's own
+                // (slightly different) alignment can land on its own "owned" side of the cutoff -
+                // e.g. "設" emitted once by chunk N (ending just before the cutoff) and again by
+                // chunk N+1 (starting just after it). VAD chunks are contiguous and share no
+                // audio, so they cannot produce this and must not be filtered, or a genuinely
+                // repeated character straddling a boundary would be dropped. Restrict the check
+                // to the start of the chunk's contribution for the same reason.
+                bool near_chunk_boundary = !use_vad_chunking && (abs_start - chunk_own_start) < 1.0;
+                if (near_chunk_boundary && !full_align_result.words.empty()) {
+                    const auto & prev = full_align_result.words.back();
+                    if (prev.word == w.word && std::fabs(abs_start - prev.end) < 0.25) {
+                        continue;
+                    }
+                }
                 w.start = abs_start;
                 w.end = abs_end;
                 full_align_result.words.push_back(w);
@@ -671,6 +783,53 @@ static int run_transcribe_and_align(const cli_params & params) {
         total_asr_ms += asr_result.t_total_ms;
         total_align_ms += align_result.t_total_ms;
         full_align_result.t_total_ms += (asr_result.t_total_ms + align_result.t_total_ms);
+    }
+
+    // Sanity-check word-to-word gaps against the VAD's own silence detection. The
+    // aligner occasionally misplaces a timestamp for a short/weakly-cued word (e.g.
+    // "本" ending abruptly and "体" not resuming for 3.5s in "本体。", even though
+    // there is no real pause between them - confirmed by inspecting the raw JSON: the
+    // VAD never detected silence there). We already know exactly where real silence
+    // is, so clamp any inter-word gap that isn't backed by an actual VAD silence
+    // region - it can only be an alignment artifact, not a real pause, and left as-is
+    // it gets misread downstream (e.g. by Subtitle Edit) as a sentence/paragraph
+    // break. This does not attempt to reconstruct the "true" timestamp - it just
+    // keeps a bogus gap from corrupting the pause-based heuristics that consume it.
+    if (use_vad_chunking && !speech_segments.empty()) {
+        const double max_ungrounded_gap = 0.4; // seconds
+        int clamped = 0;
+        for (size_t k = 0; k + 1 < full_align_result.words.size(); ++k) {
+            auto & w0 = full_align_result.words[k];
+            auto & w1 = full_align_result.words[k + 1];
+            double gap = w1.start - w0.end;
+            if (gap <= max_ungrounded_gap) {
+                continue;
+            }
+
+            double mid = (w0.end + w1.start) / 2.0;
+            bool still_in_speech = false;
+            for (const auto & seg : speech_segments) {
+                if (mid >= seg.start && mid <= seg.end) {
+                    still_in_speech = true;
+                    break;
+                }
+            }
+            if (!still_in_speech) {
+                continue; // genuine silence per VAD - trust the aligner's gap
+            }
+
+            double new_start = w0.end + max_ungrounded_gap;
+            if (w1.start > new_start) {
+                w1.start = new_start;
+                if (w1.end < w1.start) {
+                    w1.end = w1.start;
+                }
+                clamped++;
+            }
+        }
+        if (params.print_timing && clamped > 0) {
+            fprintf(stderr, "VAD sanity check: clamped %d ungrounded timestamp gap(s)\n", clamped);
+        }
     }
 
     if (params.print_timing) {
