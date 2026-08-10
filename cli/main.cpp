@@ -573,12 +573,28 @@ static int run_transcription(const cli_params & params) {
 }
 
 // The ASR model can lock into a repetition loop on wordless vocalisation - a
-// scream, laughter - and emit the same character hundreds of times in a row.
-// Qwen's own Qwen3-ASR-Toolkit collapses these before the text is used, and the
-// same applies here for a second reason: left in, the aligner has to spread a
-// meaningless run across the whole passage, which drags the surrounding
-// timestamps with it.
-static std::string collapse_repeated_chars(const std::string & text, int threshold = 20) {
+// scream, laughter - or on silence/noise with no real speech, and emit the same
+// character or short phrase over and over (e.g. "はいはいはいはいはいはいはいはい
+// はいはい。", ten repeats of "はい" - confirmed from the raw aligned JSON, with
+// degenerate near-zero/stretched timestamps to match). Qwen's own
+// Qwen3-ASR-Toolkit collapses single repeated characters before the text is
+// used; this generalizes that to short repeated phrases too, for a second
+// reason beyond readability: left in, the aligner has to spread a meaningless
+// run across the whole passage, which drags the surrounding timestamps with it.
+//
+// For each position, try every repeating-unit length up to 8 characters and
+// keep whichever collapses the most text. Longer units need fewer repeats to
+// count as a loop - a two-character word repeated 20 times is already absurd
+// at 5, whereas single-character reduplication (ええ, ーー, wwww) is common
+// enough in real Japanese/English text that only an extreme run (20+) is safe
+// to treat as a loop.
+static size_t repeat_collapse_threshold(size_t unit_len) {
+    if (unit_len == 1) return 20;
+    if (unit_len <= 3) return 4;
+    return 3;
+}
+
+static std::string collapse_repeated_chars(const std::string & text) {
     std::vector<std::string> chars;
     for (size_t i = 0; i < text.size();) {
         const unsigned char c = (unsigned char) text[i];
@@ -593,17 +609,37 @@ static std::string collapse_repeated_chars(const std::string & text, int thresho
 
     std::string out;
     size_t i = 0;
+    const size_t max_unit = 8;
     while (i < chars.size()) {
-        size_t run = 1;
-        while (i + run < chars.size() && chars[i + run] == chars[i]) {
-            run++;
+        size_t best_unit = 0, best_run = 0; // best_unit == 0 means "no loop found here"
+
+        for (size_t unit = 1; unit <= max_unit && i + unit <= chars.size(); ++unit) {
+            size_t run = 1;
+            while (i + (run + 1) * unit <= chars.size()) {
+                bool match = true;
+                for (size_t k = 0; k < unit; ++k) {
+                    if (chars[i + run * unit + k] != chars[i + k]) { match = false; break; }
+                }
+                if (!match) break;
+                run++;
+            }
+            // Rank candidates by how much text they'd collapse, not raw repeat count,
+            // so a shorter/more-repeated unit doesn't lose to a longer/less-repeated one.
+            if (run > repeat_collapse_threshold(unit) && run * unit > best_run * best_unit) {
+                best_unit = unit;
+                best_run = run;
+            }
         }
-        // A genuine repetition is short (ええ, ーー); a loop is not.
-        const size_t keep = (run > (size_t) threshold) ? 1 : run;
-        for (size_t k = 0; k < keep; ++k) {
+
+        if (best_unit > 0) {
+            for (size_t k = 0; k < best_unit; ++k) {
+                out += chars[i + k];
+            }
+            i += best_unit * best_run;
+        } else {
             out += chars[i];
+            i += 1;
         }
-        i += run;
     }
     return out;
 }
