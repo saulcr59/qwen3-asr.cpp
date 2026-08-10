@@ -7,16 +7,36 @@ Qwen3-ASR, and this model is force-aligned against it with a monotonic CTC
 Viterbi pass. That guarantees per-character timings can never contain the
 unexplained multi-second gaps the autoregressive Qwen aligner sometimes emits.
 
-Any Wav2Vec2ForCTC checkpoint works as long as it has feat_extract_norm="layer"
-and do_stable_layer_norm=True (the large XLSR family). Pick one whose tokenizer
+Any Wav2Vec2ForCTC checkpoint works as long as do_stable_layer_norm=True (the
+transformer encoder must be the pre-norm variant). Either feat_extract_norm
+variant is supported: "layer" (LayerNorm on every conv layer, e.g. the XLSR
+family) or "group" (GroupNorm on conv layer 0 only, no normalisation on the
+rest, e.g. the ReazonSpeech wav2vec2 family). Pick one whose tokenizer
 vocabulary covers the script you align - for Japanese,
 jonatasgrosman/wav2vec2-large-xlsr-53-japanese includes kanji, not just kana.
+
+A checkpoint's config declares its CTC blank as tokenizer.pad_token_id, and
+that is the default here. Verify it is actually correct before trusting it:
+some released checkpoints never confidently predict that id at all, favouring
+a different token as their de facto blank instead (confirmed on
+reazon-research/japanese-wav2vec2-large-rs35kh, where >95% of frames land on
+<unk> and effectively 0% land on the declared pad token - reproducible with
+transformers' own Wav2Vec2Processor.batch_decode, so it's a property of the
+released weights, not of this converter or the C++ aligner). Check with a
+short forward pass on real audio (argmax token-id histogram) before
+converting, and pass --blank-id to override if the declared pad token isn't
+actually the dominant one.
 
 Usage:
     python scripts/convert_wav2vec2_ctc_to_gguf.py \
         --input jonatasgrosman/wav2vec2-large-xlsr-53-japanese \
         --output models/wav2vec2-ctc-ja-f16.gguf \
         --type f16
+
+    python scripts/convert_wav2vec2_ctc_to_gguf.py \
+        --input reazon-research/japanese-wav2vec2-large-rs35kh \
+        --output models/wav2vec2-ctc-ja-reazon-large-f16.gguf \
+        --type f16 --blank-id 0
 """
 
 from __future__ import annotations
@@ -62,6 +82,10 @@ def main() -> int:
     ap.add_argument("--input", required=True, help="HF model id or local path")
     ap.add_argument("--output", required=True, help="output .gguf path")
     ap.add_argument("--type", choices=["f16", "f32"], default="f16")
+    ap.add_argument("--blank-id", type=int, default=None,
+                     help="override the CTC blank token id (default: tokenizer.pad_token_id). "
+                          "Some checkpoints never confidently predict the declared pad token - "
+                          "see the module docstring.")
     args = ap.parse_args()
 
     from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
@@ -71,10 +95,11 @@ def main() -> int:
     model = Wav2Vec2ForCTC.from_pretrained(args.input).eval()
     cfg = model.config
 
-    if cfg.feat_extract_norm != "layer" or not cfg.do_stable_layer_norm:
+    if cfg.feat_extract_norm not in ("layer", "group") or not cfg.do_stable_layer_norm:
         logger.error(
             "unsupported variant: feat_extract_norm=%s do_stable_layer_norm=%s "
-            "(the C++ side implements the layer-norm / stable-layer-norm variant only)",
+            "(the C++ side implements the stable-layer-norm encoder only, with "
+            "either the layer-norm or group-norm feature extractor)",
             cfg.feat_extract_norm, cfg.do_stable_layer_norm,
         )
         return 1
@@ -99,8 +124,12 @@ def main() -> int:
     writer.add_uint32(f"{ARCH}.pos_conv.groups", cfg.num_conv_pos_embedding_groups)
 
     writer.add_uint32(f"{ARCH}.sample_rate", processor.feature_extractor.sampling_rate)
-    blank_id = processor.tokenizer.pad_token_id
+    blank_id = args.blank_id if args.blank_id is not None else processor.tokenizer.pad_token_id
+    if args.blank_id is not None:
+        logger.info("blank token id overridden to %d (tokenizer.pad_token_id is %d)",
+                    blank_id, processor.tokenizer.pad_token_id)
     writer.add_uint32(f"{ARCH}.blank_token_id", blank_id)
+    writer.add_string(f"{ARCH}.feat_extract_norm", cfg.feat_extract_norm)
 
     # ---- CTC vocabulary ---------------------------------------------------
     # Stored index-ordered so the C++ side can build id -> token directly; the
@@ -115,11 +144,20 @@ def main() -> int:
     # ---- tensors ----------------------------------------------------------
     w2v = model.wav2vec2
 
+    # feat_extract_norm="layer": every conv layer has its own LayerNorm.
+    # feat_extract_norm="group": only conv layer 0 has a norm (GroupNorm with
+    # num_groups == num_channels, i.e. per-channel normalisation across time);
+    # layers 1+ are plain conv+activation with no normalisation at all, so
+    # they have no `layer_norm` submodule to export.
     for i, layer in enumerate(w2v.feature_extractor.conv_layers):
         add_tensor(writer, f"conv.{i}.weight", layer.conv.weight, want_f16)
-        add_tensor(writer, f"conv.{i}.bias", layer.conv.bias, want_f16)
-        add_tensor(writer, f"conv.{i}.norm.weight", layer.layer_norm.weight, want_f16)
-        add_tensor(writer, f"conv.{i}.norm.bias", layer.layer_norm.bias, want_f16)
+        # conv_bias=False (seen on the ReazonSpeech group-norm family) leaves
+        # this None - ggml's conv_1d has no bias term of its own either way.
+        if layer.conv.bias is not None:
+            add_tensor(writer, f"conv.{i}.bias", layer.conv.bias, want_f16)
+        if hasattr(layer, "layer_norm"):
+            add_tensor(writer, f"conv.{i}.norm.weight", layer.layer_norm.weight, want_f16)
+            add_tensor(writer, f"conv.{i}.norm.bias", layer.layer_norm.bias, want_f16)
 
     add_tensor(writer, "feat_proj.norm.weight", w2v.feature_projection.layer_norm.weight, want_f16)
     add_tensor(writer, "feat_proj.norm.bias", w2v.feature_projection.layer_norm.bias, want_f16)

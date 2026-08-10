@@ -138,6 +138,14 @@ bool CtcAligner::parse_hparams(gguf_context * ctx) {
         return false;
     }
 
+    // Feature extractor normalisation variant. Only our own converter writes
+    // this key, so its absence (third-party GGUFs) defaults to the original
+    // layer-norm behaviour those files were always assumed to have.
+    int64_t norm_idx = gguf_find_key(ctx, "wav2vec2-ctc.feat_extract_norm");
+    if (norm_idx >= 0 && gguf_get_kv_type(ctx, norm_idx) == GGUF_TYPE_STRING) {
+        hp.feat_extract_group_norm = (std::string(gguf_get_val_str(ctx, norm_idx)) == "group");
+    }
+
     // Conv stack: either three arrays (ours) or one key per layer (theirs).
     auto get_i32_array = [&](const char * key, std::vector<int32_t> & out) -> bool {
         int64_t idx = gguf_find_key(ctx, key);
@@ -249,16 +257,25 @@ bool CtcAligner::create_tensors(gguf_context * ctx, ggml_context * meta_ctx) {
         }
         return it->second;
     };
+    auto maybe = [&](const std::string & n) -> ggml_tensor * {
+        auto it = tensors_.find(n);
+        return it == tensors_.end() ? nullptr : it->second;
+    };
 
     const auto & hp = hparams_;
 
     conv_layers_.resize(hp.conv_dim.size());
     for (size_t i = 0; i < conv_layers_.size(); ++i) {
         const std::string p = "conv." + std::to_string(i);
-        conv_layers_[i].w      = need(p + ".weight");
-        conv_layers_[i].b      = need(p + ".bias");
-        conv_layers_[i].norm_w = need(p + ".norm.weight");
-        conv_layers_[i].norm_b = need(p + ".norm.bias");
+        conv_layers_[i].w = need(p + ".weight");
+        // Some checkpoints (e.g. conv_bias=False) omit the conv bias entirely.
+        conv_layers_[i].b = maybe(p + ".bias");
+        // Group-norm variant: only conv layer 0 has a norm; leave norm_w/norm_b
+        // null for the rest so build_graph() skips normalisation for them.
+        if (!hp.feat_extract_group_norm || i == 0) {
+            conv_layers_[i].norm_w = need(p + ".norm.weight");
+            conv_layers_[i].norm_b = need(p + ".norm.bias");
+        }
     }
 
     feat_proj_norm_w_ = need("feat_proj.norm.weight");
@@ -402,22 +419,53 @@ ggml_cgraph * CtcAligner::build_graph(ggml_context * ctx0, ggml_tensor * input) 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_CTC_MAX_NODES, false);
 
     // --- convolutional feature encoder -------------------------------------
-    // Layout note: ggml_conv_1d takes [time, channels] and returns [time, channels],
-    // but LayerNorm has to run across channels, which ggml normalises along ne[0].
-    // So each layer transposes into [channels, time] to normalise and back again.
+    // Layout note: ggml_conv_1d takes [time, channels] and returns [time, channels].
+    //
+    // Layer-norm variant: LayerNorm runs across channels, which ggml normalises
+    // along ne[0], so each layer transposes into [channels, time] to normalise
+    // and back again.
+    //
+    // Group-norm variant: only conv layer 0 is normalised, with GroupNorm
+    // configured so num_groups == num_channels - i.e. each channel is
+    // normalised independently across time, not across channels at a fixed
+    // time step. That maps onto ggml_group_norm's own axis convention
+    // (groups along ne[2], normalising over ne0*ne1*channels_per_group), so
+    // the [time, channels] tensor is reshaped to 4D [time, 1, channels, 1]
+    // instead of transposed. Layers 1+ get no normalisation at all, matching
+    // Wav2Vec2NoLayerNormConvLayer.
     ggml_tensor * cur = input;  // [n_samples, 1]
     for (size_t i = 0; i < conv_layers_.size(); ++i) {
         const auto & cl = conv_layers_[i];
         cur = ggml_conv_1d(ctx0, cl.w, cur, hp.conv_stride[i], 0, 1);
-        cur = add_channel_bias(ctx0, cur, cl.b);
-
-        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));           // [channels, time]
-        cur = layer_norm(ctx0, cur, cl.norm_w, cl.norm_b, hp.layer_norm_eps);
-        cur = ggml_gelu_erf(ctx0, cur);
-
-        if (i + 1 < conv_layers_.size()) {
-            cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));       // back to [time, channels]
+        if (cl.b) {
+            cur = add_channel_bias(ctx0, cur, cl.b);
         }
+
+        if (hp.feat_extract_group_norm) {
+            if (cl.norm_w) {
+                const int64_t n_time = cur->ne[0];
+                const int64_t n_ch   = cur->ne[1];
+                ggml_tensor * cur4 = ggml_reshape_4d(ctx0, cur, n_time, 1, n_ch, 1);
+                cur4 = ggml_group_norm(ctx0, cur4, (int) n_ch, hp.layer_norm_eps);
+                ggml_tensor * w4 = ggml_reshape_4d(ctx0, cl.norm_w, 1, 1, n_ch, 1);
+                ggml_tensor * b4 = ggml_reshape_4d(ctx0, cl.norm_b, 1, 1, n_ch, 1);
+                cur4 = ggml_mul(ctx0, cur4, w4);
+                cur4 = ggml_add(ctx0, cur4, b4);
+                cur = ggml_reshape_2d(ctx0, cur4, n_time, n_ch);
+            }
+            cur = ggml_gelu_erf(ctx0, cur);
+        } else {
+            cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));           // [channels, time]
+            cur = layer_norm(ctx0, cur, cl.norm_w, cl.norm_b, hp.layer_norm_eps);
+            cur = ggml_gelu_erf(ctx0, cur);
+
+            if (i + 1 < conv_layers_.size()) {
+                cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));       // back to [time, channels]
+            }
+        }
+    }
+    if (hp.feat_extract_group_norm) {
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));               // [time, channels] -> [channels, time]
     }
     // cur is [conv_dim, n_frames], which is already what the projection wants.
 

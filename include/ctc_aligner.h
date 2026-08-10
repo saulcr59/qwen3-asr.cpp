@@ -25,6 +25,11 @@ struct ctc_hparams {
     std::vector<int32_t> conv_stride;
     std::vector<int32_t> conv_kernel;
 
+    // false: LayerNorm on every conv layer (XLSR family). true: GroupNorm
+    // (num_groups == num_channels) on conv layer 0 only, no normalisation on
+    // the rest (ReazonSpeech family).
+    bool feat_extract_group_norm = false;
+
     int32_t pos_conv_kernel = 128;
     int32_t pos_conv_groups = 16;
 
@@ -81,17 +86,20 @@ public:
     alignment_result align(const float * samples, int n_samples,
                             const std::vector<std::string> & chars);
 
+    // Runs the acoustic model and returns row-major [n_frames][vocab_size]
+    // log-probabilities. Exposed publicly (mirroring AudioEncoder's
+    // encode_conv_only/encode_no_chunk) so it can be numerically validated
+    // against a PyTorch reference forward pass independent of the Viterbi
+    // decoding that consumes it.
+    bool compute_emissions(const float * samples, int n_samples,
+                            std::vector<float> & emissions, int & n_frames);
+
     [[nodiscard]] const std::string & get_error() const { return error_msg_; }
 
 private:
     bool parse_hparams(gguf_context * ctx);
     bool create_tensors(gguf_context * ctx, ggml_context * meta_ctx);
     bool load_tensor_data(const std::string & path, gguf_context * ctx);
-
-    // Runs the acoustic model and returns row-major [n_frames][vocab_size]
-    // log-probabilities.
-    bool compute_emissions(const float * samples, int n_samples,
-                            std::vector<float> & emissions, int & n_frames);
 
     ggml_cgraph * build_graph(ggml_context * ctx0, ggml_tensor * input);
 
