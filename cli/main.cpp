@@ -60,6 +60,11 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "Forced Alignment:\n");
     fprintf(stderr, "  --align                Enable forced alignment mode\n");
     fprintf(stderr, "  --text <text>          Reference transcript for alignment\n");
+    fprintf(stderr, "  --text-file <path>     Read the reference transcript from a UTF-8 file instead.\n");
+    fprintf(stderr, "                         Required for non-Latin-1 text on Windows, where argv is\n");
+    fprintf(stderr, "                         converted to the ANSI codepage before main() runs.\n");
+    fprintf(stderr, "                         --align also accepts --ctc-align-model to align with a\n");
+    fprintf(stderr, "                         wav2vec2 CTC model instead of the Qwen aligner.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Transcribe + Align:\n");
     fprintf(stderr, "  -a, --transcribe-align Run ASR then forced alignment\n");
@@ -81,8 +86,50 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  Forced Alignment:\n");
     fprintf(stderr, "    %s -m models/qwen3-forced-aligner-0.6b-f16.gguf -f sample.wav --align --text \"Hello world\"\n", prog);
     fprintf(stderr, "\n");
+    fprintf(stderr, "  Forced Alignment (CTC, transcript from a file):\n");
+    fprintf(stderr, "    %s --ctc-align-model models/wav2vec2-ctc-ja.gguf -f sample.wav --align --text-file transcript.txt\n", prog);
+    fprintf(stderr, "\n");
     fprintf(stderr, "  Transcribe + Align:\n");
     fprintf(stderr, "    %s -m models/qwen3-asr-0.6b-f16.gguf --aligner-model models/qwen3-forced-aligner-0.6b-f16.gguf -f sample.wav --transcribe-align\n", prog);
+}
+
+// Reads a UTF-8 transcript verbatim. Text cannot arrive through argv on Windows:
+// the CRT narrows the wide command line using the ANSI codepage before main()
+// runs, so anything outside that codepage becomes '?' - a Japanese transcript
+// turns into a row of question marks before any of our code sees it.
+static bool read_text_file(const std::string & path, std::string & out) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "Error: Failed to open text file: %s\n", path.c_str());
+        return false;
+    }
+
+    std::string raw;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        raw.append(buf, n);
+    }
+    fclose(f);
+
+    // .NET's File.WriteAllText emits a UTF-8 BOM by default, and it would
+    // otherwise become a leading alignment token that matches no audio.
+    if (raw.size() >= 3 && (unsigned char) raw[0] == 0xEF &&
+                           (unsigned char) raw[1] == 0xBB &&
+                           (unsigned char) raw[2] == 0xBF) {
+        raw.erase(0, 3);
+    }
+
+    // Line structure carries no acoustic meaning. Fold it to spaces, which
+    // split_transcript_tokens() already treats as word boundaries (and skips
+    // outright for CJK), so a multi-line transcript aligns as one utterance.
+    out.clear();
+    out.reserve(raw.size());
+    for (const char c : raw) {
+        out += (c == '\r' || c == '\n' || c == '\t') ? ' ' : c;
+    }
+
+    return true;
 }
 
 static bool parse_args(int argc, char ** argv, cli_params & params) {
@@ -163,6 +210,14 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
                 return false;
             }
             params.align_text = argv[++i];
+        } else if (strcmp(arg, "--text-file") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: %s requires an argument\n", arg);
+                return false;
+            }
+            if (!read_text_file(argv[++i], params.align_text)) {
+                return false;
+            }
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -178,7 +233,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
     }
     
     if (params.align_mode && params.align_text.empty()) {
-        fprintf(stderr, "Error: Reference text is required for alignment mode (--text)\n");
+        fprintf(stderr, "Error: Reference text is required for alignment mode (--text or --text-file)\n");
         return false;
     }
 
@@ -447,51 +502,96 @@ static std::string find_korean_dict(const std::string & model_path) {
     return "";
 }
 
+static std::vector<std::string> split_transcript_tokens(const std::string & text);
+
 static int run_alignment(const cli_params & params) {
     const std::string align_lang = normalize_language_name(params.language);
 
+    // The same two interchangeable back-ends --transcribe-align offers, except the
+    // transcript comes from the caller instead of an ASR pass. That is the point of
+    // this mode: text produced elsewhere (a cloud ASR with no timestamps, an existing
+    // subtitle file) still needs timings, and CTC alignment is monotonic by
+    // construction so it cannot leave a hole in the middle of continuous speech.
+    const bool use_ctc = !params.ctc_aligner_model_path.empty();
+
     fprintf(stderr, "qwen3-asr-cli (Forced Alignment Mode)\n");
-    fprintf(stderr, "  Model: %s\n", params.model_path.c_str());
+    fprintf(stderr, "  Model: %s\n", use_ctc
+            ? (params.ctc_aligner_model_path + " (CTC)").c_str()
+            : params.model_path.c_str());
     fprintf(stderr, "  Audio: %s\n", params.audio_path.c_str());
-    fprintf(stderr, "  Text: %s\n", params.align_text.c_str());
+    if (params.align_text.size() > 200) {
+        fprintf(stderr, "  Text: (%zu bytes)\n", params.align_text.size());
+    } else {
+        fprintf(stderr, "  Text: %s\n", params.align_text.c_str());
+    }
     if (!align_lang.empty()) {
         fprintf(stderr, "  Language: %s\n", align_lang.c_str());
     }
     fprintf(stderr, "\n");
-    
-    qwen3_asr::ForcedAligner aligner;
-    
-    if (!aligner.load_model(params.model_path)) {
-        fprintf(stderr, "Error: %s\n", aligner.get_error().c_str());
-        return 1;
-    }
-    aligner.set_n_threads(params.n_threads);
-    
-    if (align_lang == "korean") {
-        std::string dict_path = find_korean_dict(params.model_path);
-        if (dict_path.empty()) {
-            fprintf(stderr, "Warning: Korean dictionary not found. Falling back to whitespace splitting.\n");
-        } else {
-            if (!aligner.load_korean_dict(dict_path)) {
-                fprintf(stderr, "Warning: Failed to load Korean dictionary from %s\n", dict_path.c_str());
+
+    qwen3_asr::alignment_result result;
+
+    if (use_ctc) {
+        qwen3_asr::CtcAligner ctc_aligner;
+        if (!ctc_aligner.load_model(params.ctc_aligner_model_path)) {
+            fprintf(stderr, "Error (CTC Aligner): %s\n", ctc_aligner.get_error().c_str());
+            return 1;
+        }
+        ctc_aligner.set_n_threads(params.n_threads);
+
+        std::vector<float> samples;
+        int sample_rate;
+        if (!load_wav(params.audio_path, samples, sample_rate)) {
+            fprintf(stderr, "Error: Failed to load audio file: %s\n", params.audio_path.c_str());
+            return 1;
+        }
+        if (sample_rate != 16000) {
+            fprintf(stderr, "Error: Audio must be 16kHz\n");
+            return 1;
+        }
+
+        fprintf(stderr, "Model loaded. Running alignment...\n");
+        result = ctc_aligner.align(samples.data(), (int) samples.size(),
+                                   split_transcript_tokens(params.align_text));
+    } else {
+        qwen3_asr::ForcedAligner aligner;
+
+        if (!aligner.load_model(params.model_path)) {
+            fprintf(stderr, "Error: %s\n", aligner.get_error().c_str());
+            return 1;
+        }
+        aligner.set_n_threads(params.n_threads);
+
+        if (align_lang == "korean") {
+            std::string dict_path = find_korean_dict(params.model_path);
+            if (dict_path.empty()) {
+                fprintf(stderr, "Warning: Korean dictionary not found. Falling back to whitespace splitting.\n");
+            } else {
+                if (!aligner.load_korean_dict(dict_path)) {
+                    fprintf(stderr, "Warning: Failed to load Korean dictionary from %s\n", dict_path.c_str());
+                }
             }
         }
+
+        fprintf(stderr, "Model loaded. Running alignment...\n");
+
+        result = aligner.align(params.audio_path, params.align_text, align_lang);
     }
-    
-    fprintf(stderr, "Model loaded. Running alignment...\n");
-    
-    auto result = aligner.align(params.audio_path, params.align_text, align_lang);
-    
+
     if (!result.success) {
         fprintf(stderr, "Error: %s\n", result.error_msg.c_str());
         return 1;
     }
-    
+
     if (params.print_timing) {
         fprintf(stderr, "\nTiming:\n");
-        fprintf(stderr, "  Mel spectrogram: %lld ms\n", (long long)result.t_mel_ms);
-        fprintf(stderr, "  Audio encoding:  %lld ms\n", (long long)result.t_encode_ms);
-        fprintf(stderr, "  Text decoding:   %lld ms\n", (long long)result.t_decode_ms);
+        if (!use_ctc) {
+            // CTC has no mel/decode stages of its own, so reporting them would
+            // only ever print zeros.
+            fprintf(stderr, "  Mel spectrogram: %lld ms\n", (long long)result.t_mel_ms);
+            fprintf(stderr, "  Audio encoding:  %lld ms\n", (long long)result.t_encode_ms);
+            fprintf(stderr, "  Text decoding:   %lld ms\n", (long long)result.t_decode_ms);
+        }
         fprintf(stderr, "  Total:           %lld ms\n", (long long)result.t_total_ms);
         fprintf(stderr, "  Words aligned:   %zu\n", result.words.size());
     }
